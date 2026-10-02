@@ -5,7 +5,7 @@ import './global.css';
 import { Toaster } from 'sonner';
 
 export const metadata: Metadata = {
-  title: 'AIOps SecureWatch | SecOps Center',
+  title: 'AegisApex | SecOps Center',
   description: 'AI-powered network infrastructure telemetry, vulnerability analysis, and change simulation.',
 };
 
