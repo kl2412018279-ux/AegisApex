@@ -1,0 +1,10 @@
+netmiko==4.3.0
+supabase==2.3.4
+python-dotenv==1.0.1
+schedule==1.2.2
+groq==0.11.0
+// Handles SSH connections and command execution across multi-vendor network hardware,netmiko
+//The Python SDK that interacts with Supabase database (saving configurations, reading device tables, calling Vault RPCs)
+// Safely loads environment variables (like API keys and DB URLs) from .env files into Python memory.
+// Runs background jobs on a recurring schedule ( set ; triggering collector.py every 1 hour).
+// The client library used to communicate with Groq's high-speed AI API for running LLM analysis.

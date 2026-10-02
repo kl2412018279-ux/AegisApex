@@ -1,0 +1,143 @@
+{
+  "patterns": [
+    {
+      "id": "cisco_secret_type5_8_9",
+      "description": "Cisco Enable/Username Type 5, 8, and 9 encrypted secrets",
+      "regex": "((?:secret|password)\\s+(?:5|8|9)\\s+)(\\$\\d\\$[^\\s]+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "PASS_HASH",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "cisco_type7_passwords",
+      "description": "Cisco Type 7 weak reversible passwords",
+      "regex": "(password\\s+7\\s+)([0-9A-Fa-f]+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "PASS_TYPE7",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "aruba_cx_ciphertext_plaintext",
+      "description": "ArubaOS / Aruba CX ciphertext and plaintext user passwords",
+      "regex": "(password\\s+(?:ciphertext|plaintext)\\s+)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "ARUBA_PASS",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "unix_aruba_crypt_hash",
+      "description": "Unix / Linux / Aruba SHA-512 ($6$), SHA-256 ($5$), and MD5 ($1$) crypt hashes including rounds=",
+      "regex": "(\\$[156]\\$(?:rounds=\\d+\\$)?[-_a-zA-Z0-9./]+\\$[-_a-zA-Z0-9./+=!]+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "CRYPT_HASH",
+      "secretGroup": 1
+    },
+    {
+      "id": "juniper_9_encrypted",
+      "description": "Juniper $9$ encrypted secret credentials (quoted or unquoted)",
+      "regex": "(encrypted-password|secret)\\s+([\"']?)(\\$9\\$[^\"'\\s]+)([\"']?)",
+      "flags": "gi",
+      "mode": "quoted",
+      "tokenCategory": "JUNIPER_HASH",
+      "secretGroup": 3,
+      "quoteGroup": 2,
+      "prefixGroups": [1, " "]
+    },
+    {
+      "id": "fortinet_enc_passwords",
+      "description": "Fortinet FortiOS ENC encrypted strings",
+      "regex": "(set\\s+(?:password|secret|pre-shared-key)\\s+)(ENC\\s+\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "FORTI_ENC",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "huawei_hp_cipher_simple",
+      "description": "Huawei VRP and HP Comware cipher/simple passwords",
+      "regex": "(password\\s+(?:cipher|simple)\\s+)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "HUAWEI_PASS",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "paloalto_phash",
+      "description": "Palo Alto PAN-OS phash credentials",
+      "regex": "((?:phash|bind-password)\\s+)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "PANOS_HASH",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "mikrotik_quoted_secrets",
+      "description": "MikroTik RouterOS quoted secrets",
+      "regex": "((?:password|secret)=\")([^\"]+)(\")",
+      "flags": "gi",
+      "mode": "quoted",
+      "tokenCategory": "MIKROTIK_PASS",
+      "secretGroup": 2,
+      "quoteGroup": 3,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "snmp_community_strings",
+      "description": "SNMP Read/Write community strings and host notification tokens",
+      "regex": "(snmp-server\\s+(?:community|host\\s+\\S+\\s+(?:version\\s+\\S+\\s+)?))(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "SNMP_COMMUNITY",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "radius_tacacs_keys",
+      "description": "AAA Shared Secrets (RADIUS, TACACS+, key-string)",
+      "regex": "((?:tacacs-server|radius-server|key-string)\\s+(?:host\\s+\\S+\\s+)?(?:key|secret)\\s+(?:0|7)?\\s*)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "AAA_KEY",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "ipsec_ike_psk",
+      "description": "IPsec / ISAKMP Pre-Shared Keys",
+      "regex": "((?:crypto\\s+isakmp\\s+key|pre-shared-key\\s+(?:local|remote|ascii|hex)?)\\s+)([^\\s\\n]+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "IPSEC_PSK",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    },
+    {
+      "id": "ssh_private_keys",
+      "description": "Embedded SSH RSA/OpenSSH/EC Private Keys",
+      "regex": "-----BEGIN (?:RSA|EC|OPENSSH|DSA)? PRIVATE KEY-----[\\s\\S]*?-----END (?:RSA|EC|OPENSSH|DSA)? PRIVATE KEY-----",
+      "flags": "g",
+      "mode": "wholeMatch",
+      "tokenCategory": "PRIVATE_KEY"
+    },
+    {
+      "id": "generic_credential_fallback",
+      "description": "Fallback rule for Dell OS10, VyOS, Extreme EXOS, F5 TMSH, and unhandled vendors",
+      "regex": "((?:pre-shared-key|secret|password|auth-password)\\s+(?:\\d+\\s+|hash\\s+|encrypted\\s+)?)([^\\s\\n!]+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "GENERIC_SECRET",
+      "secretGroup": 2,
+      "prefixGroups": [1]
+    }
+  ]
+}

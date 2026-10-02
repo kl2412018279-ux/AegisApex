@@ -1,0 +1,30 @@
+﻿# Dependencies
+**/node_modules/
+
+# Env & secrets (every location, every variant)
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Next.js build output
+**/.next/
+**/tsconfig.tsbuildinfo
+
+# Python
+**/__pycache__/
+**/venv/
+**/.venv/
+**/env/
+*.py[cod]
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
