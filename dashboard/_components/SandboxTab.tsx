@@ -155,7 +155,7 @@ export function SandboxTab({
         </form>
       </div>
 
-      {/* Output Terminal Panel */}
+            {/* Output Terminal Panel */}
       <div
         className={`rounded-xl border flex flex-col h-[650px] overflow-hidden ${
           isDarkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200 shadow-sm'
@@ -187,7 +187,11 @@ export function SandboxTab({
             {sandboxAnalysis && (
               <button
                 onClick={handleCopyAnalysis}
-                className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[10px] font-mono transition-colors border border-slate-700 cursor-pointer"
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-mono transition-colors border cursor-pointer ${
+                  isDarkMode
+                    ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                }`}
                 title="Copy full analysis text"
               >
                 {copied ? (
@@ -197,7 +201,7 @@ export function SandboxTab({
                   </>
                 ) : (
                   <>
-                    <Copy className="w-3 h-3 text-slate-400" />
+                    <Copy className={`w-3 h-3 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`} />
                     <span>Copy</span>
                   </>
                 )}
@@ -207,10 +211,23 @@ export function SandboxTab({
         </div>
 
         {/* Formatted Output Canvas */}
-        <div className="flex-1 p-5 overflow-y-auto bg-slate-950 text-slate-200 leading-relaxed rounded-b-xl border-t border-slate-900 text-xs">
+        {/* FIX: this whole panel body was hardcoded to dark-theme colors
+            (bg-slate-950/text-slate-200/border-slate-900) with no isDarkMode
+            check at all, and renderFormattedAnalysis was called with a
+            hardcoded `true` for its isDark argument regardless of the real
+            toggle state — so the AI-rendered text itself always used dark
+            palette colors too. Both are now conditional, matching the other
+            panels (ConfigTab/VersionTab), plus theme-aware scrollbar styling. */}
+        <div
+          className={`flex-1 p-5 overflow-y-auto leading-relaxed rounded-b-xl border-t text-xs [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full ${
+            isDarkMode
+              ? 'bg-slate-950 text-slate-200 border-slate-900 [&::-webkit-scrollbar-thumb]:bg-slate-700'
+              : 'bg-slate-50 text-slate-800 border-slate-200 [&::-webkit-scrollbar-thumb]:bg-slate-300'
+          }`}
+        >
           {sandboxAnalysis ? (
-            <div className="prose prose-invert max-w-none space-y-3 font-sans">
-              {renderFormattedAnalysis(sandboxAnalysis, true)}
+            <div className={`prose max-w-none space-y-3 font-sans ${isDarkMode ? 'prose-invert' : ''}`}>
+              {renderFormattedAnalysis(sandboxAnalysis, isDarkMode)}
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-full text-slate-500 text-center p-6 space-y-2">

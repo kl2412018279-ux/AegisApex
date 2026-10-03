@@ -99,7 +99,7 @@ export function useDashboard() {
     const formattedDevices: Device[] = devicesData.map((d: any) => {
       const dbScanRisk = scanMap[d.id];
       const cachedRisk = aiCache[d.id]?.riskLevel;
-      
+
       const highestDbRisk = getHighestRisk(d.risk_level, dbScanRisk);
       const normalizedRisk = getHighestRisk(highestDbRisk, cachedRisk);
 
@@ -247,8 +247,8 @@ export function useDashboard() {
         os_summary: osSummaryText,
         version_info: versionInfoText,
         os_cves: [],
-        target_firmware: 'Latest Recommended LTS Release',
-        eol_status: 'Mainstream Support Active',
+        target_firmware: scanData.target_firmware || 'Not yet analyzed',
+        eol_status: scanData.eol_status || 'Not yet analyzed',
       });
     } catch (err) {
       console.error('Error fetching scan results:', err);
@@ -380,6 +380,20 @@ export function useDashboard() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             deviceId: selectedDevice.id,
+            // FIX: this call never passed scanId, so /api/scan's own
+            // persistence logic always took its INSERT branch — forking a
+            // brand-new `scans` row instead of updating the one the
+            // /api/analyze-firmware call directly above just wrote
+            // target_firmware/eol_status into. That new row became the
+            // "latest" scan by created_at with those two fields empty, so
+            // the very next fetchScanResults() picked up the fresh, blank
+            // row and showed "Not yet analyzed" even though the real AI
+            // answer had been persisted to the database seconds earlier, to
+            // a different, now-orphaned row. Passing scan?.id here makes
+            // /api/scan update that same row instead of forking a duplicate,
+            // so "Run AI Assessment" and "Re-analyze Firmware" now leave the
+            // device in the same state instead of disagreeing.
+            scanId: scan?.id || null,
             configurationId: scan?.configuration_id || null,
             vendor: selectedDevice.vendor || 'Cisco',
             rawConfig: rawConfigContent,
@@ -484,6 +498,13 @@ export function useDashboard() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               deviceId: dev.id,
+              // FIX: same gap as handleRunScan above — this bulk path never
+              // passed scanId either, so every "Scan All Inventory" run
+              // forked a brand-new scans row per device instead of updating
+              // the existing one, stranding any target_firmware/eol_status
+              // the paired /api/analyze-firmware call (below) had just
+              // written to the old row.
+              scanId: latestScanRecord?.id || null,
               vendor: dev.vendor || 'Cisco',
               rawConfig: configContent,
               rawVersion: versionContent,
@@ -702,6 +723,7 @@ export function useDashboard() {
       return;
     }
 
+    setIsScanning(true);
     try {
       const res = await fetch('/api/analyze-firmware', {
         method: 'POST',
@@ -775,6 +797,10 @@ export function useDashboard() {
       toast.error('❌ Error Running Firmware Audit', {
         description: err.message,
       });
+    } finally {
+      // FIX: always release the lock, success or failure, so the button
+      // isn't stuck disabled forever if the request errors out.
+      setIsScanning(false);
     }
   }
 

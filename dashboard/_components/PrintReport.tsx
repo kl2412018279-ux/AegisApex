@@ -1,10 +1,11 @@
 //dashboard\_components\PrintReport.tsx
+//dashboard\_components\PrintReport.tsx
 import React from 'react';
 import { Shield, ShieldAlert, CheckCircle2, Cpu, AlertTriangle, AlertCircle, FileCheck, Lock } from 'lucide-react';
 import { sanitizeConfig } from '@/lib/sanitizer';
 import { Device, ScanResult } from '../_types/dashboard.types';
 import { getRiskColor } from '../_utils/riskHelpers';
-import { renderFormattedAnalysis } from '../_utils/formatters';
+import { renderPrintAnalysis } from '../_utils/formatters';
 
 interface PrintReportProps {
   selectedDevice: Device | null;
@@ -234,100 +235,95 @@ export function PrintReport({
         }
       `}</style>
 
-      {/* Formal Header */}
-      <div className="border-b-2 border-slate-900 pb-4 mb-5 flex justify-between items-end">
-        <div>
-          <div className="flex items-center gap-2">
-            <Shield className="w-5 h-5 text-slate-900" />
-            <h1 className="text-sm font-black tracking-widest uppercase font-mono text-slate-900">
-              AIOps SecureWatch
-            </h1>
-            <span className="text-xs font-mono font-bold text-slate-500">| EXECUTIVE AUDIT</span>
+      {/* Header */}
+      <div className="flex items-start justify-between pb-5 mb-6 border-b border-slate-200">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-md bg-slate-900 flex items-center justify-center shrink-0">
+            <Shield className="w-5 h-5 text-white" />
           </div>
-          <p className="text-[9px] font-mono text-slate-500 uppercase tracking-widest mt-1">
-            Single Asset Vulnerability & Compliance Technical Report
-          </p>
+          <div>
+            <h1 className="text-[15px] font-semibold text-slate-900 tracking-tight leading-none">
+              AegisApex
+            </h1>
+            <p className="text-[11px] text-slate-500 mt-1">Single Asset Vulnerability &amp; Compliance Report</p>
+          </div>
         </div>
 
-        <div className="text-right font-mono text-[9px] space-y-0.5">
-          <div className="inline-flex items-center gap-1 px-2 py-0.5 bg-slate-100 text-slate-900 border border-slate-400 font-bold text-[8px] uppercase tracking-wider mb-1">
-            <Lock className="w-2.5 h-2.5 text-slate-700" /> RESTRICTED DOCUMENT
-          </div>
-          <p className="text-slate-600">Generated: <span className="font-bold text-slate-900">{displayDate}</span></p>
-          <p className="text-slate-600">Audit Ref: <span className="font-bold text-slate-900">{auditId}</span></p>
+        <div className="text-right text-[10.5px] text-slate-500 space-y-1.5">
+          <span className="inline-flex items-center gap-1 text-[9.5px] font-medium text-slate-600 bg-slate-100 rounded px-2 py-0.5">
+            <Lock className="w-2.5 h-2.5" /> Confidential
+          </span>
+          <p>Generated <span className="font-medium text-slate-900">{displayDate}</span></p>
+          <p>Audit Ref <span className="font-medium text-slate-900">{auditId}</span></p>
         </div>
       </div>
 
-      <div className="space-y-5">
-        {/* Asset Inventory Overview Matrix */}
-        <div className="avoid-break">
-          <div className="text-[9px] font-mono uppercase font-bold text-slate-500 mb-1.5 flex justify-between border-b border-slate-300 pb-0.5">
-            <span>Asset Identification Matrix</span>
-            <span>Status: Active Managed Node</span>
+      <div className="space-y-6">
+        {/* Asset Identification */}
+        <div className="grid grid-cols-2 gap-x-8 gap-y-3 p-4 border border-slate-200 rounded-lg avoid-break">
+          <div>
+            <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Hostname</p>
+            <p className="text-[11.5px] font-medium text-slate-900">{selectedDevice.hostname}</p>
           </div>
-          <table className="w-full text-left border-collapse border border-slate-300 text-[9.5px]">
-            <tbody>
-              <tr className="border-b border-slate-200">
-                <td className="p-2 bg-slate-50 font-mono font-bold text-slate-600 border-r border-slate-300 w-1/4">Hostname</td>
-                <td className="p-2 font-mono font-bold text-slate-900 border-r border-slate-300 w-1/4">{selectedDevice.hostname}</td>
-                <td className="p-2 bg-slate-50 font-mono font-bold text-slate-600 border-r border-slate-300 w-1/4">Management IP</td>
-                <td className="p-2 font-mono font-bold text-slate-900 w-1/4">{displayIp}</td>
-              </tr>
-              <tr>
-                <td className="p-2 bg-slate-50 font-mono font-bold text-slate-600 border-r border-slate-300">Platform OS</td>
-                <td className="p-2 text-slate-900 border-r border-slate-300 uppercase">{selectedDevice.vendor || 'Generic'} ({platformType})</td>
-                <td className="p-2 bg-slate-50 font-mono font-bold text-slate-600 border-r border-slate-300">Supplier / Scope</td>
-                <td className="p-2 text-slate-900">{supplierName}</td>
-              </tr>
-            </tbody>
-          </table>
+          <div>
+            <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Management IP</p>
+            <p className="text-[11.5px] font-medium text-slate-900">{displayIp}</p>
+          </div>
+          <div>
+            <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Platform OS</p>
+            <p className="text-[11.5px] text-slate-900">{selectedDevice.vendor || 'Generic'} ({platformType})</p>
+          </div>
+          <div>
+            <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Supplier / Scope</p>
+            <p className="text-[11.5px] text-slate-900">{supplierName}</p>
+          </div>
         </div>
 
         {/* Threat Status & Executive Summary */}
-        <div className="border border-slate-300 p-4 bg-slate-50/50 flex items-stretch gap-4 border-l-4 border-l-slate-900 avoid-break">
-          <div className="border-r border-slate-300 pr-4 shrink-0 flex flex-col justify-center items-center w-32 text-center">
-            <span className="text-[8px] font-mono uppercase font-bold text-slate-500 block mb-1">Evaluated Threat</span>
-            <span className={`px-2.5 py-1 text-[10px] font-black font-mono border uppercase tracking-wider block w-full ${getRiskColor(scanRisk, false).badge}`}>
+        <div className="flex gap-4 p-4 border border-slate-200 rounded-lg avoid-break">
+          <div className="flex flex-col items-center w-28 shrink-0 border-r border-slate-100 pr-4 pt-0.5 text-center">
+            <span className="text-[9px] uppercase tracking-wide text-slate-400 font-medium mb-1.5">Evaluated Threat</span>
+            <span className={`px-2.5 py-1 rounded text-[11px] font-semibold uppercase tracking-wide block ${getRiskColor(scanRisk, false).badge}`}>
               {scanRisk}
             </span>
           </div>
-          <div className="flex-1 flex flex-col justify-center">
-            <span className="font-bold uppercase font-mono text-[9px] tracking-wider block mb-1 text-slate-900">
-              Executive Assessment Summary
-            </span>
-            <p className="text-slate-700 leading-relaxed text-[10px]">{executiveSummary}</p>
+          <div className="flex-1">
+            <p className="text-[11px] font-semibold text-slate-900 mb-1.5">Executive Assessment Summary</p>
+            <div className="text-[10.5px] text-slate-600 leading-relaxed">
+              {renderPrintAnalysis(executiveSummary)}
+            </div>
           </div>
         </div>
 
-        {/* Configuration Vulnerabilities Section */}
-        <div className="space-y-2 avoid-break">
-          <div className="flex justify-between items-center border-b-2 border-slate-900 pb-1">
-            <h2 className="text-[10.5px] font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5 font-mono">
-              <ShieldAlert className="w-3.5 h-3.5 text-slate-900" />
+        {/* Configuration Vulnerabilities */}
+        <div className="avoid-break">
+          <div className="flex justify-between items-center mb-2.5">
+            <h2 className="text-[13px] font-semibold text-slate-900 flex items-center gap-1.5">
+              <ShieldAlert className="w-3.5 h-3.5 text-slate-400" />
               1. Running Configuration Vulnerabilities
             </h2>
-            <span className="text-[9px] font-mono text-slate-600">
-              Violations: <strong className="text-slate-900 font-bold">{vulnerabilities.length}</strong>
+            <span className="text-[10px] text-slate-500">
+              {vulnerabilities.length} violation{vulnerabilities.length === 1 ? '' : 's'}
             </span>
           </div>
 
           {vulnerabilities.length === 0 ? (
             scanRisk === 'CRITICAL' || scanRisk === 'HIGH' ? (
-              <div className="p-3 border border-slate-300 bg-slate-50 text-[9.5px] text-slate-800 flex items-start gap-2.5">
-                <AlertCircle className="w-4 h-4 text-slate-700 shrink-0 mt-0.5" />
+              <div className="p-3.5 border border-slate-200 rounded-lg bg-slate-50 text-[10px] text-slate-700 flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
                 <div>
-                  <strong className="block font-bold uppercase font-mono text-[8.5px] mb-0.5">Configuration Rule Baseline Clean</strong>
-                  <span>No syntax rule violations detected. Threat rating assigned as <strong className="uppercase">{scanRisk}</strong> based on operating system lifecycle compliance (Section 2).</span>
+                  <p className="font-semibold text-slate-900 mb-0.5">Configuration rule baseline clean</p>
+                  <p>No syntax rule violations detected. Threat rating assigned as <strong>{scanRisk}</strong> based on operating system lifecycle compliance (Section 2).</p>
                 </div>
               </div>
             ) : (
-              <div className="p-3 border border-slate-300 bg-slate-50 text-[9.5px] text-slate-800 flex items-center gap-2.5">
-                <CheckCircle2 className="w-4 h-4 text-slate-700 shrink-0" />
+              <div className="p-3.5 border border-slate-200 rounded-lg bg-slate-50 text-[10px] text-slate-700 flex items-center gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-slate-400 shrink-0" />
                 <span>Running configuration satisfies security baseline requirements. Zero configuration vulnerabilities detected.</span>
               </div>
             )
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-2.5">
               {vulnerabilities.map((v: any, idx: number) => {
                 const title = v.title || v.name || v.cve || v.rule || `Finding #${idx + 1}`;
                 const severity = (v.severity || v.risk || v.level || 'MEDIUM').toUpperCase();
@@ -335,21 +331,21 @@ export function PrintReport({
                 const remediation = v.remediation_cli || v.remediationCli || v.remediation || v.fix || '';
 
                 return (
-                  <div key={v.id || idx} className="border border-slate-300 p-2.5 text-[9px] space-y-1.5 bg-white avoid-break">
-                    <div className="flex justify-between items-center border-b border-slate-200 pb-1">
-                      <span className="font-bold text-slate-900 text-[10px] flex items-center gap-1.5 font-mono">
-                        <AlertTriangle className="w-3 h-3 text-slate-700" />
+                  <div key={v.id || idx} className="border border-slate-200 rounded-lg p-3 text-[10px] space-y-2 avoid-break">
+                    <div className="flex justify-between items-center gap-3">
+                      <span className="font-semibold text-slate-900 text-[10.5px] flex items-center gap-1.5">
+                        <AlertTriangle className="w-3 h-3 text-slate-400 shrink-0" />
                         {idx + 1}. {title}
                       </span>
-                      <span className={`px-2 py-0.5 text-[8px] font-mono font-bold border uppercase tracking-wider ${getRiskColor(severity, false).badge}`}>
+                      <span className={`px-2 py-0.5 rounded text-[8.5px] font-semibold uppercase tracking-wide shrink-0 ${getRiskColor(severity, false).badge}`}>
                         {severity}
                       </span>
                     </div>
-                    <p className="text-slate-700 leading-normal">{description}</p>
+                    <p className="text-slate-600 leading-relaxed">{description}</p>
                     {remediation && (
-                      <div className="bg-slate-900 text-slate-100 p-2 text-[8px] font-mono border border-slate-800 mt-1">
-                        <span className="text-slate-400 font-bold uppercase text-[7px] block mb-0.5 font-mono">Remediation Script:</span>
-                        <code className="whitespace-pre-wrap block leading-tight">{sanitizeConfig(remediation)}</code>
+                      <div className="bg-slate-900 text-slate-100 rounded-md p-2.5 text-[8.5px] font-mono mt-1.5">
+                        <p className="text-slate-400 font-medium uppercase tracking-wide text-[7.5px] mb-1">Remediation Script</p>
+                        <code className="whitespace-pre-wrap block leading-relaxed">{sanitizeConfig(remediation)}</code>
                       </div>
                     )}
                   </div>
@@ -359,50 +355,39 @@ export function PrintReport({
           )}
         </div>
 
-        {/* Firmware & OS Compliance Section */}
-        <div className="space-y-2 pt-1 avoid-break">
-          <div className="border-b-2 border-slate-900 pb-1">
-            <h2 className="text-[10.5px] font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5 font-mono">
-              <Cpu className="w-3.5 h-3.5 text-slate-900" />
-              2. Firmware Compliance & Lifecycle Risk
-            </h2>
+        {/* Firmware & OS Compliance */}
+        <div className="avoid-break">
+          <h2 className="text-[13px] font-semibold text-slate-900 flex items-center gap-1.5 mb-2.5">
+            <Cpu className="w-3.5 h-3.5 text-slate-400" />
+            2. Firmware Compliance &amp; Lifecycle Risk
+          </h2>
+
+          <div className="grid grid-cols-2 gap-x-8 gap-y-3 p-4 border border-slate-200 rounded-lg mb-3">
+            <div>
+              <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Target Version</p>
+              <p className="text-[11px] font-medium text-slate-900">{targetFirmware}</p>
+            </div>
+            <div>
+              <p className="text-[9.5px] uppercase tracking-wide text-slate-400 font-medium mb-0.5">Lifecycle Status</p>
+              <p className="text-[11px] font-medium text-slate-900">{eolStatus}</p>
+            </div>
           </div>
 
-          <table className="w-full border-collapse border border-slate-300 text-[9px] font-mono">
-            <tbody>
-              <tr className="border-b border-slate-200">
-                <td className="p-2 bg-slate-50 font-bold text-slate-600 border-r border-slate-300 w-1/3 uppercase text-[8px]">Target Version</td>
-                <td className="p-2 text-slate-900 font-bold">{targetFirmware}</td>
-              </tr>
-              <tr>
-                <td className="p-2 bg-slate-50 font-bold text-slate-600 border-r border-slate-300 uppercase text-[8px]">Lifecycle Status</td>
-                <td className="p-2 text-slate-900 font-bold">{eolStatus}</td>
-              </tr>
-            </tbody>
-          </table>
-
-          <div className="border border-slate-300 p-3 text-[9px] bg-white">
-            <span className="font-bold block mb-1 uppercase text-[8px] font-mono text-slate-500 border-b border-slate-200 pb-0.5">
-              Detailed OS / Firmware Security Analysis:
-            </span>
-            <div className="text-slate-800 leading-relaxed font-sans pt-1">
-              {renderFormattedAnalysis(osAnalysisText, false)}
+          <div className="border border-slate-200 rounded-lg p-3.5 text-[10px]">
+            <p className="font-semibold text-slate-900 mb-1.5">Detailed OS / Firmware Security Analysis</p>
+            <div className="text-slate-600 leading-relaxed">
+              {renderPrintAnalysis(osAnalysisText)}
             </div>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="pt-3 border-t-2 border-slate-900 text-[8px] font-mono text-slate-500 flex justify-between items-end avoid-break">
-          <div className="space-y-0.5">
-            <p className="text-slate-900 font-bold flex items-center gap-1">
-              <FileCheck className="w-3 h-3 text-slate-900" /> AIOps SecureWatch Audit Engine
-            </p>
-            <p className="text-slate-500">Official technical risk assessment and operational compliance document.</p>
+        <div className="pt-3 border-t border-slate-200 text-[9px] text-slate-400 flex justify-between items-center avoid-break">
+          <div className="flex items-center gap-1.5">
+            <FileCheck className="w-3 h-3 text-slate-400" />
+            <span>AegisApex &middot; Official technical risk assessment and operational compliance document</span>
           </div>
-          <div className="text-right">
-            <p className="text-slate-900 font-bold uppercase">Classification: Restricted</p>
-            <p className="text-slate-500">Page 1 of 1</p>
-          </div>
+          <span>Page 1 of 1</span>
         </div>
       </div>
     </div>

@@ -24,9 +24,8 @@ export function ConfigTab({
   aiCache,
   latestScan,
 }: ConfigTabProps) {
-  // Resolve valid config payload from props or selectedDevice state, ignoring '!' stubs
   const displayConfig = useMemo(() => {
-    const rawCandidate = 
+    const rawCandidate =
       currentRawConfig && currentRawConfig.trim() !== '!'
         ? currentRawConfig
         : selectedDevice?.last_config || (selectedDevice as any)?.config || '';
@@ -36,6 +35,10 @@ export function ConfigTab({
 
     return sanitizeConfig(trimmed);
   }, [currentRawConfig, selectedDevice]);
+
+  const sessionAnalysis = selectedDevice?.id ? aiCache[selectedDevice.id]?.config : null;
+  const persistedAnalysis = latestScan?.summary || (latestScan as any)?.executive_summary;
+  const configSummaryToRender = sessionAnalysis || persistedAnalysis;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -62,10 +65,10 @@ export function ConfigTab({
         </div>
 
         <div
-          className={`flex-1 p-4 overflow-y-auto font-mono text-xs leading-relaxed rounded-b-xl border-t ${
+          className={`flex-1 p-4 overflow-y-auto font-mono text-xs leading-relaxed rounded-b-xl border-t [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full ${
             isDarkMode
-              ? 'bg-slate-950 text-slate-300 border-slate-900'
-              : 'bg-slate-900 text-slate-200 border-slate-800'
+              ? 'bg-slate-950 text-slate-300 border-slate-900 [&::-webkit-scrollbar-thumb]:bg-slate-700'
+              : 'bg-slate-50 text-slate-800 border-slate-200 [&::-webkit-scrollbar-thumb]:bg-slate-300'
           }`}
         >
           {displayConfig ? (
@@ -110,14 +113,18 @@ export function ConfigTab({
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto space-y-3 pr-1">
+        <div
+          className={`flex-1 overflow-y-auto space-y-3 pr-1 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full ${
+            isDarkMode ? '[&::-webkit-scrollbar-thumb]:bg-slate-700' : '[&::-webkit-scrollbar-thumb]:bg-slate-300'
+          }`}
+        >
           {/* Priority 1: Active session AI cache analysis */}
-          {selectedDevice?.id && aiCache[selectedDevice.id]?.config ? (
+          {sessionAnalysis ? (
             <div className="p-2">
-              {renderFormattedAnalysis(aiCache[selectedDevice.id].config!, isDarkMode)}
+              {renderFormattedAnalysis(sessionAnalysis, isDarkMode)}
             </div>
           ) : latestScan?.vulnerabilities && latestScan.vulnerabilities.length > 0 ? (
-            /* Priority 2: Structured static CIS benchmark vulnerabilities */
+            /* Priority 2: Structured static CIS benchmark vulnerabilities (unchanged) */
             latestScan.vulnerabilities.map((v: Vulnerability, idx: number) => {
               const vRisk = getRiskColor(v.severity, isDarkMode);
               const remediation = v.remediation_cli || (v as any).remediationCli || '';
@@ -171,14 +178,17 @@ export function ConfigTab({
                 </div>
               );
             })
+          ) : persistedAnalysis ? (
+            <div className="p-2">
+              {renderFormattedAnalysis(persistedAnalysis, isDarkMode)}
+            </div>
           ) : (
-            /* Priority 3: Clean state requiring explicit AI Assessment execution */
             <div className="flex flex-col items-center justify-center h-full text-slate-500 text-center p-6 space-y-2">
               <Shield className="w-8 h-8 text-slate-600 mb-1" />
               <p className="font-semibold text-slate-400 text-xs">
                 No Active AI Audit Results
               </p>
-              
+
             </div>
           )}
         </div>

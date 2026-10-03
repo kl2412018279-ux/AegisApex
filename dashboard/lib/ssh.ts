@@ -40,7 +40,7 @@ export async function executeCLICommands(
       if (isSettled) return;
       isSettled = true;
       cleanup();
-      reject(new Error(`SSH execution timed out after \({timeout}ms on\){params.host}`));
+      reject(new Error(`SSH execution timed out after ${timeout}ms on ${params.host}`));
     }, timeout);
 
     // Prepend terminal pagination suppression based on vendor

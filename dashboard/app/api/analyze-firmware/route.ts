@@ -1,6 +1,14 @@
 // dashboard/app/api/analyze-firmware/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseAdmin } from '@/lib/supabase';
+// FIX: this route used to run its own ad-hoc vendor detection
+// (`vendor.toLowerCase().includes('cisco')` etc.) completely separately from
+// the real detectVendor() in cisBenchmarks.ts. Two parallel, independently
+// maintained vendor-classification implementations WILL drift apart — e.g.
+// cisBenchmarks.ts treats "comware"/"hp" as aruba_hpe, this file didn't know
+// that vendor existed at all. Now both files agree on vendor classification
+// by construction, because there's only one implementation.
+import { detectVendor, VendorType } from '@/lib/cisBenchmarks';
 
 export type RiskLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 
@@ -17,6 +25,13 @@ interface FirmwareAnalysis {
   summary: string;
   cves: string[];
   recommendations: string[];
+  // NEW: previously these two values were never produced by the AI at all —
+  // they were hardcoded three layers downstream (useDashboard.ts's
+  // fetchScanResults/handleAnalyzeFirmware, then VersionTab.tsx's
+  // deriveFirmwareMetrics vendor-guess table). The LLM now returns them
+  // directly, same as it already does for cves/recommendations.
+  targetFirmware: string;
+  eolStatus: string;
 }
 
 const RISK_RANKS: Record<RiskLevel, number> = {
@@ -62,65 +77,221 @@ function getDeterministicFirmwareRisk(rawVersion: string, cves: string[] = []): 
   return 'LOW';
 }
 
-/**
- * Returns platform-specific default security advisories when Groq API is offline or unreachable.
- */
-function getVendorFallback(vendor: string, hostname: string): { cves: string[]; recommendations: string[]; summary: string } {
-  const v = vendor.toLowerCase();
-  
-  if (v.includes('cisco')) {
-    return {
-      cves: ['CVE-2023-20198', 'CVE-2023-20273'],
-      recommendations: [
-        'Enforce SSHv2 protocol and restrict line vty access lists.',
-        'Upgrade IOS-XE release to latest active maintenance train.',
-        'Disable HTTP/HTTPS integrated web server if unused.',
-      ],
-      summary: `Firmware analysis completed for ${hostname} (Cisco IOS). OS version detected; verify active web UI configuration and management ACLs.`,
-    };
-  }
+interface VendorFallbackEntry {
+  cves: string[];
+  recommendations: string[];
+  summary: string;
+  targetFirmware: string;
+  eolStatus: string;
+}
 
-  if (v.includes('dell')) {
-    return {
-      cves: ['CVE-2022-2917'],
-      recommendations: [
-        'Upgrade OS10 image to the latest recommended LTS maintenance release.',
-        'Ensure RESTCONF/eAPI management endpoints enforce strict TLS 1.2+ encryption.',
-        'Restrict control-plane administrative access via explicit management VRF policy.',
-      ],
-      summary: `Firmware analysis completed for target host ${hostname} running Dell OS10. System version identified; check Dell Security Advisories for baseline OS updates.`,
-    };
-  }
-
-  if (v.includes('aruba') || v.includes('aoscx')) {
-    return {
-      cves: ['CVE-2023-35984'],
-      recommendations: [
-        'Migrate to recommended ArubaOS-CX LTS release train.',
-        'Disable cleartext REST API management services on default VRF.',
-        'Verify AAA RADIUS server failover configuration for local user accounts.',
-      ],
-      summary: `Firmware audit complete for ${hostname} (ArubaOS-CX). System version identified; review vendor portal for platform release updates.`,
-    };
-  }
-
-  return {
+// FIX: this used to only cover cisco/dell/aruba, with everything else —
+// including fortinet, despite fortinet having full CIS rule coverage in
+// cisBenchmarks.ts — silently landing on one generic bucket. The whole
+// system is built as multi-vendor (see VendorType in cisBenchmarks.ts);
+// this fallback table now matches that same vendor list 1:1. This is ONLY
+// the offline/last-resort safety net used when Groq is unreachable or
+// returns nothing usable — the LLM call above it is still the primary
+// source of truth per-device.
+const VENDOR_FALLBACK_MATRIX: Record<VendorType, (hostname: string) => VendorFallbackEntry> = {
+  cisco_ios: (h) => ({
+    cves: ['CVE-2023-20198', 'CVE-2023-20273'],
+    recommendations: [
+      'Enforce SSHv2 protocol and restrict line vty access lists.',
+      'Upgrade IOS-XE release to latest active maintenance train.',
+      'Disable HTTP/HTTPS integrated web server if unused.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Cisco IOS). OS version detected; verify active web UI configuration and management ACLs.`,
+    targetFirmware: 'Cisco IOS-XE 17.09.05 LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  cisco_nxos: (h) => ({
+    cves: ['CVE-2023-20123'],
+    recommendations: [
+      'Upgrade NX-OS to the latest recommended maintenance release for this platform.',
+      'Disable legacy Telnet/HTTP management features (feature telnet / feature http-server).',
+      'Restrict management-plane access via a dedicated mgmt0 VRF and ACL.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Cisco NX-OS). Verify current release against Cisco's NX-OS security advisories.`,
+    targetFirmware: 'Cisco NX-OS 10.3(x) LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  cisco_xr: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade IOS-XR to the latest recommended maintenance release for this platform.',
+      'Restrict management plane protection (MPP) to trusted interfaces only.',
+      'Disable unused XML/NETCONF agents if not actively used for automation.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Cisco IOS-XR). Verify current release against Cisco's IOS-XR security advisories.`,
+    targetFirmware: 'Cisco IOS-XR 7.9.x LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  juniper: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade Junos to the latest recommended EEOL (Extended End-of-Life) release train.',
+      'Disable Telnet services and enforce SSH-only system services.',
+      'Enable login password format sha-512 for all local accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Juniper Junos). Verify current release against Juniper's published EEOL schedule.`,
+    targetFirmware: 'Junos 21.4 EEOL',
+    eolStatus: 'Active / Supported',
+  }),
+  arista: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade EOS to the latest recommended release in Arista\'s current release train.',
+      'Disable the HTTP management API protocol, keep HTTPS only.',
+      'Enforce AAA authentication via TACACS+/RADIUS rather than local-only accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Arista EOS). Verify current release against Arista's security advisories.`,
+    targetFirmware: 'Arista EOS 4.31.x',
+    eolStatus: 'Active / Supported',
+  }),
+  fortinet: (h) => ({
+    cves: ['CVE-2022-40684'],
+    recommendations: [
+      'Upgrade FortiOS to the latest patched release in the current support train.',
+      'Restrict SSL-VPN and management-GUI exposure to trusted source IPs only.',
+      'Enable two-factor authentication for all administrative accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Fortinet FortiOS). Verify current build against Fortinet PSIRT advisories, particularly SSL-VPN CVEs.`,
+    targetFirmware: 'FortiOS 7.4.x LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  paloalto: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade PAN-OS to the latest preferred release per Palo Alto\'s release recommendation.',
+      'Disable Telnet/HTTP management services (disable-telnet / disable-http).',
+      'Enforce a dedicated authentication profile for all administrative accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Palo Alto PAN-OS). Verify current release against Palo Alto's PSIRT advisories.`,
+    targetFirmware: 'PAN-OS 11.1.x',
+    eolStatus: 'Active / Supported',
+  }),
+  huawei: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade VRP to the latest recommended patch version for this platform.',
+      'Disable the Telnet server (undo telnet server enable) and enforce SSH/Stelnet.',
+      'Configure a dedicated AAA authentication scheme rather than local-only auth.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Huawei VRP). Verify current version against Huawei's security advisories.`,
+    targetFirmware: 'Huawei VRP 8.x (current maintenance release)',
+    eolStatus: 'Active / Supported',
+  }),
+  aruba_hpe: (h) => ({
+    cves: ['CVE-2023-35984'],
+    recommendations: [
+      'Migrate to recommended ArubaOS-CX LTS release train.',
+      'Disable cleartext REST API management services on default VRF.',
+      'Verify AAA RADIUS server failover configuration for local user accounts.',
+    ],
+    summary: `Firmware audit complete for ${h} (ArubaOS-CX). System version identified; review vendor portal for platform release updates.`,
+    targetFirmware: 'ArubaOS-CX 10.13.1000 LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  dell_os10: (h) => ({
+    cves: ['CVE-2022-2917'],
+    recommendations: [
+      'Upgrade OS10 image to the latest recommended LTS maintenance release.',
+      'Ensure RESTCONF/eAPI management endpoints enforce strict TLS 1.2+ encryption.',
+      'Restrict control-plane administrative access via explicit management VRF policy.',
+    ],
+    summary: `Firmware analysis completed for target host ${h} running Dell OS10. System version identified; check Dell Security Advisories for baseline OS updates.`,
+    targetFirmware: 'Dell OS10 10.5.6.0',
+    eolStatus: 'Active / Supported',
+  }),
+  f5_tmsh: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade BIG-IP TMOS to the latest recommended point release for this version train.',
+      'Verify sys sshd Protocol is restricted to SSHv2 only.',
+      'Restrict the management interface to a dedicated out-of-band network.',
+    ],
+    summary: `Firmware analysis completed for ${h} (F5 BIG-IP / TMOS). Verify current version against F5's K-article security advisories.`,
+    targetFirmware: 'F5 BIG-IP TMOS 17.1.x',
+    eolStatus: 'Active / Supported',
+  }),
+  nokia_sros: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade SR OS to the latest recommended release for this chassis/platform.',
+      'Disable Telnet (configure system security telnet shutdown) and enforce SSH only.',
+      'Enable hash2 password storage for all local administrative accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Nokia SR OS). Verify current release against Nokia's security bulletins.`,
+    targetFirmware: 'Nokia SR OS 23.x',
+    eolStatus: 'Active / Supported',
+  }),
+  vyos: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade to the latest VyOS LTS rolling release.',
+      'Remove the Telnet service entirely (delete service telnet) and keep SSH only.',
+      'Configure RADIUS/TACACS+ authentication rather than local-only accounts.',
+    ],
+    summary: `Firmware analysis completed for ${h} (VyOS). Verify current version against the VyOS LTS release schedule.`,
+    targetFirmware: 'VyOS 1.4 LTS',
+    eolStatus: 'Active / Supported',
+  }),
+  extreme_exos: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade EXOS to the latest recommended release for this switch family.',
+      'Disable Telnet and the web UI in favor of SSH-only management (disable telnet / disable web).',
+      'Enable AAA (enable aaa) rather than relying on local accounts only.',
+    ],
+    summary: `Firmware analysis completed for ${h} (Extreme EXOS). Verify current version against Extreme Networks security advisories.`,
+    targetFirmware: 'Extreme EXOS 32.x',
+    eolStatus: 'Active / Supported',
+  }),
+  mikrotik: (h) => ({
+    cves: [],
+    recommendations: [
+      'Upgrade RouterOS to the latest stable channel release.',
+      'Disable the Telnet and www services (/ip service disable telnet,www), keep SSH/HTTPS only.',
+      'Enable RADIUS-backed authentication for administrative users.',
+    ],
+    summary: `Firmware analysis completed for ${h} (MikroTik RouterOS). Verify current version against MikroTik's changelog for security fixes.`,
+    targetFirmware: 'MikroTik RouterOS 7.x (stable channel)',
+    eolStatus: 'Active / Supported',
+  }),
+  generic: (h) => ({
     cves: [],
     recommendations: [
       'Perform hardware life-cycle check with device manufacturer.',
       'Upgrade system software to current secure baseline release.',
       'Audit management interfaces for unencrypted transport protocols.',
     ],
-    summary: `Firmware evaluation completed for host ${hostname} running ${vendor}. Check manufacturer releases for active CVE hotfixes.`,
-  };
+    summary: `Firmware evaluation completed for host ${h}. Vendor platform could not be positively identified from the available telemetry — check manufacturer releases for active CVE hotfixes manually.`,
+    targetFirmware: 'Unable to determine (unidentified platform)',
+    eolStatus: 'Unknown — verify with vendor',
+  }),
+};
+
+/**
+ * Returns platform-specific default security advisories when Groq API is
+ * offline, unreachable, or returns nothing usable. This is now the ONLY
+ * place static vendor version/lifecycle guesses live, used strictly as an
+ * offline fallback across ALL vendors this system supports (see
+ * VendorType in cisBenchmarks.ts) — not just a handful. It is never the
+ * primary source of targetFirmware/eolStatus when Groq is reachable; the
+ * LLM is asked for those directly in analyzeFirmwareWithGroq below.
+ */
+function getVendorFallback(vendorType: VendorType, hostname: string): VendorFallbackEntry {
+  return VENDOR_FALLBACK_MATRIX[vendorType](hostname);
 }
 
 async function analyzeFirmwareWithGroq(
   hostname: string,
-  vendor: string,
+  vendorType: VendorType,
   rawVersion: string
 ): Promise<FirmwareAnalysis> {
   const apiKey = process.env.GROQ_API_KEY;
+  const fallback = getVendorFallback(vendorType, hostname);
 
   if (apiKey) {
     try {
@@ -131,16 +302,26 @@ async function analyzeFirmwareWithGroq(
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: 'openai/gpt-oss-120b',
           messages: [
             {
               role: 'system',
               content:
-                'You are an expert network OS and firmware vulnerability auditor. Analyze the provided "show version" telemetry for OS version, known EOL/EOS status, and CVE security vulnerabilities SPECIFIC to the indicated vendor/OS platform. Return ONLY valid JSON with keys: riskLevel (CRITICAL|HIGH|MEDIUM|LOW), summary (string), cves (string array), and recommendations (string array). Do NOT invent CVEs for unrelated hardware vendors.',
+                // FIX: the model was previously allowed to silently omit
+                // targetFirmware/eolStatus (leaving them blank, which forced
+                // this route to fall back to generic placeholder text even
+                // on a fully successful call). It's now told explicitly
+                // that these two fields are REQUIRED on every response, and
+                // given exactly one sanctioned way to decline (only when the
+                // platform truly cannot be identified at all) rather than
+                // being able to leave them empty by default.
+                'You are an expert network OS and firmware vulnerability auditor. Analyze the provided "show version" telemetry for OS version, known EOL/EOS status, and CVE security vulnerabilities SPECIFIC to the indicated vendor/OS platform. Return ONLY valid JSON with keys: riskLevel (CRITICAL|HIGH|MEDIUM|LOW), summary (string), cves (string array), recommendations (string array), targetFirmware (string), and eolStatus (string). ' +
+                'targetFirmware and eolStatus are REQUIRED on every response — do not leave them blank or omit them. targetFirmware must name the vendor\'s current recommended/LTS stable release train for the EXACT platform identified (e.g. "Cisco IOS-XE 17.09.05 LTS", "FortiOS 7.4.x LTS"), based on real, current vendor lifecycle data for that platform. eolStatus must be either "Active / Supported" or "End-of-Life (EOL)", reflecting the DETECTED version\'s actual lifecycle status (not the recommended version\'s). ' +
+                'The only acceptable reason to not give a specific targetFirmware is if the vendor/OS platform itself cannot be identified from the input at all — in that exact case only, return targetFirmware "Unable to determine (unidentified platform)" and eolStatus "Unknown — verify with vendor". Do NOT invent CVEs for unrelated hardware vendors.',
             },
             {
               role: 'user',
-              content: `Device Context:\n- Hostname: ${hostname}\n- Vendor / OS Platform: ${vendor}\n\nCLI Show Version Output:\n${rawVersion}`,
+              content: `Device Context:\n- Hostname: ${hostname}\n- Vendor / OS Platform: ${vendorType}\n\nCLI Show Version Output:\n${rawVersion}`,
             },
           ],
           temperature: 0.0,
@@ -154,7 +335,7 @@ async function analyzeFirmwareWithGroq(
           .replace(/```json/g, '')
           .replace(/```/g, '')
           .trim();
-        
+
         const content = JSON.parse(rawContent);
         const parsedLLMRisk = normalizeRiskLevel(content.riskLevel);
         const cves = Array.isArray(content.cves) ? content.cves : [];
@@ -167,6 +348,17 @@ async function analyzeFirmwareWithGroq(
           summary: content.summary || 'OS/Firmware evaluation completed.',
           cves,
           recommendations: Array.isArray(content.recommendations) ? content.recommendations : [],
+          // Trust the LLM's answer when it gave one; only fall back to the
+          // vendor-specific static guess for whichever field (if any) it
+          // still left blank despite the stricter prompt above.
+          targetFirmware:
+            typeof content.targetFirmware === 'string' && content.targetFirmware.trim()
+              ? content.targetFirmware.trim()
+              : fallback.targetFirmware,
+          eolStatus:
+            typeof content.eolStatus === 'string' && content.eolStatus.trim()
+              ? content.eolStatus.trim()
+              : fallback.eolStatus,
         };
       }
     } catch (err) {
@@ -174,7 +366,6 @@ async function analyzeFirmwareWithGroq(
     }
   }
 
-  const fallback = getVendorFallback(vendor, hostname);
   const fallbackFloor = getDeterministicFirmwareRisk(rawVersion, fallback.cves);
   const fallbackRisk = getHighestRiskLevel(fallbackFloor, 'MEDIUM');
 
@@ -183,6 +374,8 @@ async function analyzeFirmwareWithGroq(
     summary: fallback.summary,
     cves: fallback.cves,
     recommendations: fallback.recommendations,
+    targetFirmware: fallback.targetFirmware,
+    eolStatus: fallback.eolStatus,
   };
 }
 
@@ -220,19 +413,28 @@ export async function POST(req: NextRequest) {
       rawVersion = `${device.hostname || 'Device'} OS Version Telemetry Default`;
     }
 
-    const vendorStr = device.netmiko_type || device.vendor || 'cisco_ios';
+    // FIX: was `device.netmiko_type || device.vendor || 'cisco_ios'` passed
+    // as a raw string straight to the Groq prompt and to getVendorFallback's
+    // own separate `.includes()` checks. Now resolved once, the same way
+    // cisBenchmarks.ts resolves it for the config-audit engine, so a device
+    // classified as e.g. aruba_hpe there is never silently treated as
+    // "generic" here.
+    const vendorInputStr = body.vendor || device.netmiko_type || device.vendor || 'cisco_ios';
+    const vendorType: VendorType = detectVendor(vendorInputStr);
     const hostnameStr = device.hostname || 'Network-Device';
-    
-    const analysis = await analyzeFirmwareWithGroq(hostnameStr, vendorStr, rawVersion);
+
+    const analysis = await analyzeFirmwareWithGroq(hostnameStr, vendorType, rawVersion);
 
     const riskBadge = analysis.riskLevel === 'CRITICAL' ? '🔴 CRITICAL' : analysis.riskLevel === 'HIGH' ? '🟠 HIGH' : analysis.riskLevel === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
 
-    const formattedMarkdownSummary = 
+    const formattedMarkdownSummary =
 `### 🔍 OS/Firmware Security Assessment
 
 * **Hostname:** ${hostnameStr}
-* **Vendor / Platform:** \`${vendorStr}\`
+* **Vendor / Platform:** \`${vendorType}\`
 * **Evaluated Threat Level:** **${riskBadge}**
+* **Recommended LTS Release:** ${analysis.targetFirmware}
+* **Lifecycle Support Status:** ${analysis.eolStatus}
 
 ---
 
@@ -244,7 +446,7 @@ export async function POST(req: NextRequest) {
 ### 🚨 Potential Known Vulnerabilities / CVEs (${analysis.cves.length})
 
 ${
-  analysis.cves.length > 0 
+  analysis.cves.length > 0
     ? analysis.cves.map((c: string) => `* ⚠️ **${c}**`).join('\n')
     : '✅ *No critical baseline CVE matches identified for this OS image.*'
 }
@@ -269,6 +471,11 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
     // asks Postgres for "any one" matching row, not the most recent one —
     // on a device with multiple scan rows this could update an old scan
     // instead of the latest. Added `.order('created_at', { ascending: false })`.
+    //
+    // NEW: both the update and insert payloads below now also persist
+    // target_firmware/eol_status, so the AI-derived values survive a page
+    // refresh instead of fetchScanResults() hardcoding placeholder strings
+    // over them (see the matching fix in useDashboard.ts).
     let dbPersisted = false;
     let dbWarning: string | null = null;
 
@@ -289,6 +496,8 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
               status: 'completed',
               risk_level: analysis.riskLevel,
               summary: formattedMarkdownSummary,
+              target_firmware: analysis.targetFirmware,
+              eol_status: analysis.eolStatus,
               updated_at: nowIso,
             })
             .eq('id', existingScan[0].id);
@@ -312,6 +521,8 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
                 status: 'completed',
                 risk_level: analysis.riskLevel,
                 summary: formattedMarkdownSummary,
+                target_firmware: analysis.targetFirmware,
+                eol_status: analysis.eolStatus,
                 created_at: nowIso,
                 updated_at: nowIso,
               });
@@ -340,6 +551,11 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
       result: formattedMarkdownSummary,
       cves: analysis.cves,
       aiAnalysis: analysis,
+      // NEW: these two are what useDashboard.ts's handleAnalyzeFirmware()
+      // was already trying to read (data.targetFirmware / data.eolStatus) —
+      // it just never received them before now.
+      targetFirmware: analysis.targetFirmware,
+      eolStatus: analysis.eolStatus,
       // FIX: surfaced instead of pretending the write always succeeds (see note above)
       dbPersisted,
       dbWarning,
@@ -353,4 +569,3 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
     );
   }
 }
-

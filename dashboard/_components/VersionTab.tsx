@@ -4,6 +4,16 @@ import { Cpu, Sparkles, Loader2 } from 'lucide-react';
 import { Device, ScanResult, AiCacheEntry } from '../_types/dashboard.types';
 import { getRiskColor } from '../_utils/riskHelpers';
 import { renderFormattedAnalysis } from '../_utils/formatters';
+// FIX: this file used to run its own tiny ad-hoc vendor check
+// (`vendorStr.includes('cisco')` etc., covering only cisco/aruba/dell) as
+// its last-resort guess for a never-analyzed device. That's the same
+// vendor-detection duplication problem fixed in analyze-firmware/route.ts —
+// now this file uses the one real detectVendor() too, so "never analyzed
+// yet" devices on any of the 16 platforms cisBenchmarks.ts knows about get
+// a sensible vendor-specific placeholder instead of all non-Cisco/Aruba/Dell
+// vendors (Fortinet included) falling into one generic "Vendor Secure
+// Baseline" bucket.
+import { detectVendor, VendorType } from '../lib/cisBenchmarks';
 
 interface VersionTabProps {
   isDarkMode: boolean;
@@ -16,6 +26,33 @@ interface VersionTabProps {
   handleAnalyzeFirmware: () => void;
   isScanning?: boolean;
 }
+
+// NEW: this is purely a DISPLAY placeholder for a device that has never
+// been through /api/analyze-firmware at all yet (latestScan.target_firmware
+// is empty and the cached AI text, if any, doesn't contain an explicit
+// upgrade-version phrase). It only ever needs to look plausible until the
+// person clicks "Re-analyze Firmware" / "Run AI Assessment" once — the real
+// value always comes from the AI afterward. Kept intentionally lighter than
+// the backend's VENDOR_FALLBACK_MATRIX (no CVEs/recommendations needed
+// here, just a name + lifecycle guess per platform).
+const VENDOR_BASELINE_DISPLAY: Record<VendorType, { target: string; eol: string }> = {
+  cisco_ios: { target: 'Cisco IOS-XE 17.09.05 LTS', eol: 'Active / Supported' },
+  cisco_nxos: { target: 'Cisco NX-OS 10.3(x) LTS', eol: 'Active / Supported' },
+  cisco_xr: { target: 'Cisco IOS-XR 7.9.x LTS', eol: 'Active / Supported' },
+  juniper: { target: 'Junos 21.4 EEOL', eol: 'Active / Supported' },
+  arista: { target: 'Arista EOS 4.31.x', eol: 'Active / Supported' },
+  fortinet: { target: 'FortiOS 7.4.x LTS', eol: 'Active / Supported' },
+  paloalto: { target: 'PAN-OS 11.1.x', eol: 'Active / Supported' },
+  huawei: { target: 'Huawei VRP 8.x (current maintenance release)', eol: 'Active / Supported' },
+  aruba_hpe: { target: 'ArubaOS-CX 10.13.1000 LTS', eol: 'Active / Supported' },
+  dell_os10: { target: 'Dell OS10 10.5.6.0', eol: 'Active / Supported' },
+  f5_tmsh: { target: 'F5 BIG-IP TMOS 17.1.x', eol: 'Active / Supported' },
+  nokia_sros: { target: 'Nokia SR OS 23.x', eol: 'Active / Supported' },
+  vyos: { target: 'VyOS 1.4 LTS', eol: 'Active / Supported' },
+  extreme_exos: { target: 'Extreme EXOS 32.x', eol: 'Active / Supported' },
+  mikrotik: { target: 'MikroTik RouterOS 7.x (stable channel)', eol: 'Active / Supported' },
+  generic: { target: 'Unable to determine (unidentified platform)', eol: 'Unknown — verify with vendor' },
+};
 
 export function VersionTab({
   isDarkMode,
@@ -57,21 +94,20 @@ export function VersionTab({
     }
 
     // 3. Hardware Vendor Baseline Fallbacks
+    // FIX: replaced the old 3-vendor `.includes()` chain (cisco/aruba/dell
+    // only, everything else incl. fortinet => generic "Vendor Secure
+    // Baseline") with the same detectVendor() used everywhere else in the
+    // system, plus a lookup table covering all 16 platforms.
     if (!target || target.toLowerCase().includes('recommended') || target.toLowerCase().includes('latest')) {
       const vendorStr = `${selectedDevice?.vendor || ''} ${selectedDevice?.netmiko_type || ''} ${currentRawVersion}`.toLowerCase();
-      if (vendorStr.includes('aruba') || vendorStr.includes('aoscx')) {
-        target = 'ArubaOS-CX 10.13.1000 LTS';
-      } else if (vendorStr.includes('cisco')) {
-        target = 'Cisco IOS-XE 17.09.05 LTS';
-      } else if (vendorStr.includes('dell')) {
-        target = 'Dell OS10 10.5.6.0';
-      } else {
-        target = 'Vendor Secure Baseline';
-      }
+      const vendorType = detectVendor(vendorStr);
+      target = VENDOR_BASELINE_DISPLAY[vendorType].target;
     }
 
     if (!eol) {
-      eol = 'Mainstream Active';
+      const vendorStr = `${selectedDevice?.vendor || ''} ${selectedDevice?.netmiko_type || ''} ${currentRawVersion}`.toLowerCase();
+      const vendorType = detectVendor(vendorStr);
+      eol = VENDOR_BASELINE_DISPLAY[vendorType].eol;
     }
 
     return { targetFirmware: target, eolStatus: eol };
@@ -167,7 +203,13 @@ export function VersionTab({
             </button>
           </div>
 
-          <div className="flex-1 p-4 overflow-y-auto font-mono text-xs bg-slate-950 text-slate-300 leading-relaxed rounded-b-xl border-t border-slate-900">
+          <div
+            className={`flex-1 p-4 overflow-y-auto font-mono text-xs leading-relaxed rounded-b-xl border-t ${
+              isDarkMode
+                ? 'bg-slate-950 text-slate-300 border-slate-900'
+                : 'bg-slate-50 text-slate-800 border-slate-200'
+            }`}
+          >
             {currentRawVersion.trim() ? (
               <pre className="whitespace-pre-wrap break-words">{currentRawVersion}</pre>
             ) : (

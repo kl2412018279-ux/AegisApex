@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { scanForPromptInjection, wrapUntrustedContent, PromptInjectionScanResult } from '@/lib/security';
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_MODEL = process.env.GROQ_MODEL ||  'openai/gpt-oss-120b';
 
 export type ImpactLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 export type DisruptionRisk = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
