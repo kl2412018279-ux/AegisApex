@@ -77,6 +77,79 @@ function getDeterministicFirmwareRisk(rawVersion: string, cves: string[] = []): 
   return 'LOW';
 }
 
+// FIX (real bug, confirmed by hand): the LLM would periodically return CVE
+// IDs that are not real for the evaluated platform — either fully invented,
+// or a misattributed ID copied from a different vendor's advisory/report
+// numbering. Concretely: for a Cisco IOS-XE 17.9.5 device, the model once
+// returned CVE-2024-2005, CVE-2024-2006 and CVE-2024-2007 — none of which
+// are Cisco CVEs; CVE-2024-2005 isn't even a CVE at all, it's an unrelated
+// Cisco Talos *vulnerability report* ID (TALOS-2024-2005), misremembered as
+// a CVE number. A CVE list that doesn't survive one NVD search is worse
+// than no CVE list on a security-auditing tool, so every ID the model
+// proposes is now checked against the public NVD REST API before being
+// shown or persisted.
+//
+// This is a verification step, not a lookup: the LLM still proposes
+// candidates (no NVD full-text search is performed here, just an exact
+// cveId existence check), we only refuse to surface one NVD doesn't
+// confirm exists.
+//
+// Deliberately fails OPEN on a network/timeout/rate-limit error (keeps the
+// candidate as-is) and fails CLOSED only on a confirmed "no such CVE" — an
+// unreachable NVD is not evidence a CVE is fake, but a confirmed 404 is.
+async function verifyCvesAgainstNvd(candidates: string[]): Promise<string[]> {
+  const CVE_RE = /^CVE-\d{4}-\d{4,7}$/i;
+  const syntacticallyValid = Array.from(
+    new Set(
+      candidates
+        .map((c) => String(c || '').trim().toUpperCase())
+        .filter((c) => CVE_RE.test(c))
+    )
+  );
+
+  // Hard cap: this checks against a third-party API with no key (NVD's
+  // public rate limit is ~5 requests/30s), not a bulk import job. A single
+  // firmware analysis realistically surfaces a handful of CVEs — if the
+  // model ever returns more than this, something else is already wrong
+  // with that response and isn't worth burning the rate limit on.
+  const toCheck = syntacticallyValid.slice(0, 8);
+  const verified: string[] = [];
+
+  for (const cveId of toCheck) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(
+        `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${encodeURIComponent(cveId)}`,
+        { signal: controller.signal }
+      ).finally(() => clearTimeout(timeoutId));
+
+      if (res.status === 404) {
+        console.warn(`[!] Dropping unverifiable CVE from AI output (NVD 404): ${cveId}`);
+        continue;
+      }
+      if (!res.ok) {
+        // Rate-limited or NVD-side error — can't confirm either way, so
+        // don't penalize the candidate for an availability problem.
+        verified.push(cveId);
+        continue;
+      }
+      const data = await res.json();
+      if (Array.isArray(data?.vulnerabilities) && data.vulnerabilities.length > 0) {
+        verified.push(cveId);
+      } else {
+        console.warn(`[!] Dropping unverifiable CVE from AI output (no NVD record): ${cveId}`);
+      }
+    } catch (err) {
+      // Network/timeout failure — fail open, see doc comment above.
+      console.warn(`[!] NVD verification unreachable for ${cveId}, keeping candidate as unconfirmed:`, err);
+      verified.push(cveId);
+    }
+  }
+
+  return verified;
+}
+
 interface VendorFallbackEntry {
   cves: string[];
   recommendations: string[];
@@ -317,7 +390,18 @@ async function analyzeFirmwareWithGroq(
                 // being able to leave them empty by default.
                 'You are an expert network OS and firmware vulnerability auditor. Analyze the provided "show version" telemetry for OS version, known EOL/EOS status, and CVE security vulnerabilities SPECIFIC to the indicated vendor/OS platform. Return ONLY valid JSON with keys: riskLevel (CRITICAL|HIGH|MEDIUM|LOW), summary (string), cves (string array), recommendations (string array), targetFirmware (string), and eolStatus (string). ' +
                 'targetFirmware and eolStatus are REQUIRED on every response — do not leave them blank or omit them. targetFirmware must name the vendor\'s current recommended/LTS stable release train for the EXACT platform identified (e.g. "Cisco IOS-XE 17.09.05 LTS", "FortiOS 7.4.x LTS"), based on real, current vendor lifecycle data for that platform. eolStatus must be either "Active / Supported" or "End-of-Life (EOL)", reflecting the DETECTED version\'s actual lifecycle status (not the recommended version\'s). ' +
-                'The only acceptable reason to not give a specific targetFirmware is if the vendor/OS platform itself cannot be identified from the input at all — in that exact case only, return targetFirmware "Unable to determine (unidentified platform)" and eolStatus "Unknown — verify with vendor". Do NOT invent CVEs for unrelated hardware vendors.',
+                'The only acceptable reason to not give a specific targetFirmware is if the vendor/OS platform itself cannot be identified from the input at all — in that exact case only, return targetFirmware "Unable to determine (unidentified platform)" and eolStatus "Unknown — verify with vendor". Do NOT invent CVEs for unrelated hardware vendors. ' +
+                // FIX (real bug, confirmed by hand): the model was returning
+                // CVE IDs that do not exist for the evaluated platform —
+                // e.g. CVE-2024-2005/2006/2007 for a Cisco IOS-XE 17.9.5
+                // device, none of which are real Cisco CVEs (CVE-2024-2005
+                // is not even a CVE — it's an unrelated Talos vulnerability
+                // report ID). Every cves[] entry is now independently
+                // verified against the NVD database after this call returns
+                // (see verifyCvesAgainstNvd below), but the model is also
+                // told directly not to guess, since prevention beats
+                // filtering.
+                'cves must only contain CVE identifiers you are genuinely confident are real, published vulnerabilities that apply to this exact vendor/platform and version range. Never invent a CVE ID, never approximate one, and never reuse an ID you loosely recall from a different product, a different vendor, or a non-CVE report (e.g. a Talos/PSIRT advisory number is NOT a CVE ID). If you are not certain a specific CVE applies, omit it entirely — returning an empty cves array is the correct, expected answer when you have no high-confidence match, not a failure to avoid.',
             },
             {
               role: 'user',
@@ -338,7 +422,10 @@ async function analyzeFirmwareWithGroq(
 
         const content = JSON.parse(rawContent);
         const parsedLLMRisk = normalizeRiskLevel(content.riskLevel);
-        const cves = Array.isArray(content.cves) ? content.cves : [];
+        const rawCves = Array.isArray(content.cves) ? content.cves : [];
+        // FIX: verify every candidate CVE against NVD before trusting it —
+        // see verifyCvesAgainstNvd doc comment above for why.
+        const cves = await verifyCvesAgainstNvd(rawCves);
 
         const staticFloor = getDeterministicFirmwareRisk(rawVersion, cves);
         const finalRisk = getHighestRiskLevel(staticFloor, parsedLLMRisk);

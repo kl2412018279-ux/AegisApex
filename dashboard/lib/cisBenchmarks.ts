@@ -236,6 +236,132 @@ export const CIS_BENCHMARK_MATRIX: CISBenchmarkRule[] = [
       generic: { detectionKeys: ['exec-timeout', 'idle-timeout'], remediationCli: 'Configure terminal session idle timeout' },
     },
   },
+  // ───────────────────────────── NEW RULES (CIS-1.7 → CIS-1.11) ─────────────────────────────
+  {
+    ruleId: 'CIS-1.7',
+    title: 'Ensure Default SNMP Community Strings Are Removed',
+    description: 'Default or guessable SNMP community strings ("public"/"private") permit unauthenticated read or write access to device management data and must be replaced with SNMPv3.',
+    severity: 'HIGH',
+    cisControl: 'CIS Control 4.1: Secure Configuration of Enterprise Assets',
+    vendors: {
+      cisco_ios: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nno snmp-server community private\nsnmp-server group SNMPv3GRP v3 priv' },
+      cisco_nxos: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nsnmp-server user admin SNMPv3GRP auth sha8 <key> priv aes-128 <key>' },
+      cisco_xr: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nsnmp-server group SNMPv3GRP v3 priv' },
+      arista: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nsnmp-server user admin SNMPv3GRP v3 auth sha <key> priv aes-128 <key>' },
+      juniper: { detectionKeys: ['community public', 'community private'], remediationCli: 'delete snmp community public\nset snmp v3 usm local-engine user snmpv3user authentication-sha authentication-key <key> privacy-aes128 privacy-key <key>' },
+      fortinet: { detectionKeys: ['community public', 'community private'], remediationCli: 'config system snmp community\n delete 1\nend\nconfig system snmp user\n edit "snmpv3user"\n set security-level auth-priv\n next\nend' },
+      paloalto: { detectionKeys: ['version v2c', 'community public'], remediationCli: 'set deviceconfig system snmp-setting snmp-system version v3' },
+      huawei: { detectionKeys: ['snmp-agent community'], remediationCli: 'undo snmp-agent community read public\nsnmp-agent usm-user v3 snmpv3user' },
+      aruba_hpe: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nsnmpv3 user snmpv3user auth sha <key> priv aes <key>' },
+      dell_os10: { detectionKeys: ['snmp-server community public', 'snmp-server community private'], remediationCli: 'no snmp-server community public\nsnmp-server user snmpv3user auth sha <key> priv aes-128 <key>' },
+      f5_tmsh: { detectionKeys: ['communities public', 'communities private'], remediationCli: 'modify sys snmp communities delete { public }' },
+      nokia_sros: { detectionKeys: ['community "public"'], remediationCli: 'configure system security snmp community delete "public"' },
+      vyos: { detectionKeys: ['community public', 'community private'], remediationCli: 'delete service snmp community public\nset service snmp v3 group default-group mode ro' },
+      extreme_exos: { detectionKeys: ['snmp community public'], remediationCli: 'unconfigure snmp community public' },
+      mikrotik: { detectionKeys: ['community=public'], remediationCli: '/snmp community set [find name=public] disabled=yes' },
+      generic: { detectionKeys: ['community public', 'community private'], remediationCli: 'Remove default SNMP community strings and migrate to SNMPv3 with authPriv.' },
+    },
+  },
+  {
+    ruleId: 'CIS-1.8',
+    title: 'Ensure Centralized Logging (Syslog) is Configured',
+    description: 'Forward system and security events to a centralized syslog server so logs survive a device compromise and support cross-device correlation during an audit.',
+    severity: 'MEDIUM',
+    cisControl: 'CIS Control 8.2: Collect Audit Logs',
+    vendors: {
+      cisco_ios: { detectionKeys: ['logging host', 'logging trap'], remediationCli: 'logging host 10.0.0.50\nlogging trap informational' },
+      cisco_nxos: { detectionKeys: ['logging server'], remediationCli: 'logging server 10.0.0.50 6' },
+      cisco_xr: { detectionKeys: ['logging host'], remediationCli: 'logging 10.0.0.50 vrf default severity info' },
+      arista: { detectionKeys: ['logging host'], remediationCli: 'logging host 10.0.0.50' },
+      juniper: { detectionKeys: ['system syslog host'], remediationCli: 'set system syslog host 10.0.0.50 any notice' },
+      fortinet: { detectionKeys: ['config log syslogd setting'], remediationCli: 'config log syslogd setting\n set status enable\n set server "10.0.0.50"\nend' },
+      paloalto: { detectionKeys: ['syslog server'], remediationCli: 'set shared log-settings syslog SYSLOG-PROFILE server LOG-SERVER server 10.0.0.50 transport UDP port 514' },
+      huawei: { detectionKeys: ['info-center loghost'], remediationCli: 'info-center loghost 10.0.0.50' },
+      aruba_hpe: { detectionKeys: ['logging host'], remediationCli: 'logging 10.0.0.50' },
+      dell_os10: { detectionKeys: ['logging server'], remediationCli: 'logging server 10.0.0.50' },
+      f5_tmsh: { detectionKeys: ['syslog remote-servers'], remediationCli: 'modify sys syslog remote-servers add { remote1 { host 10.0.0.50 } }' },
+      nokia_sros: { detectionKeys: ['log syslog'], remediationCli: 'configure log syslog 1 address 10.0.0.50' },
+      vyos: { detectionKeys: ['system syslog host'], remediationCli: 'set system syslog host 10.0.0.50 facility all level info' },
+      extreme_exos: { detectionKeys: ['configure syslog'], remediationCli: 'configure syslog add 10.0.0.50 local0' },
+      mikrotik: { detectionKeys: ['/system logging action'], remediationCli: '/system logging action set [find name=remote] remote=10.0.0.50' },
+      generic: { detectionKeys: ['logging host', 'syslog'], remediationCli: 'Configure a centralized syslog server for audit/event log forwarding.' },
+    },
+  },
+  {
+    ruleId: 'CIS-1.9',
+    title: 'Ensure a Login/Warning Banner is Configured',
+    description: 'An unauthorized-access warning banner must be presented at login for legal notice and deterrence purposes.',
+    severity: 'LOW',
+    cisControl: 'CIS Control 14.1: Security Awareness Policy',
+    vendors: {
+      cisco_ios: { detectionKeys: ['banner motd', 'banner login'], remediationCli: 'banner motd #Authorized Access Only#' },
+      cisco_nxos: { detectionKeys: ['banner motd'], remediationCli: 'banner motd #Authorized Access Only#' },
+      cisco_xr: { detectionKeys: ['banner motd', 'banner login'], remediationCli: 'banner motd #Authorized Access Only#' },
+      arista: { detectionKeys: ['banner motd', 'banner login'], remediationCli: 'banner motd\nAuthorized Access Only\nEOF' },
+      juniper: { detectionKeys: ['system login message'], remediationCli: 'set system login message "Authorized Access Only"' },
+      fortinet: { detectionKeys: ['pre-login-banner enable'], remediationCli: 'config system global\n set pre-login-banner enable\nend' },
+      paloalto: { detectionKeys: ['login-banner'], remediationCli: 'set deviceconfig system login-banner "Authorized Access Only"' },
+      huawei: { detectionKeys: ['header login'], remediationCli: 'header login information "Authorized Access Only"' },
+      aruba_hpe: { detectionKeys: ['banner motd'], remediationCli: 'banner motd "Authorized Access Only"' },
+      dell_os10: { detectionKeys: ['banner motd'], remediationCli: 'banner motd "Authorized Access Only"' },
+      f5_tmsh: { detectionKeys: ['login banner'], remediationCli: 'modify sys global-settings gui-setup disabled\nmodify auth banner-text "Authorized Access Only"' },
+      nokia_sros: { detectionKeys: ['login-banner'], remediationCli: 'configure system login-control pre-login-message "Authorized Access Only"' },
+      vyos: { detectionKeys: ['login banner'], remediationCli: 'set system login banner pre-login "Authorized Access Only"' },
+      extreme_exos: { detectionKeys: ['banner'], remediationCli: 'configure banner "Authorized Access Only"' },
+      mikrotik: { detectionKeys: ['/system note'], remediationCli: '/system note set note="Authorized Access Only" show-at-login=yes' },
+      generic: { detectionKeys: ['banner'], remediationCli: 'Configure an unauthorized-access warning banner.' },
+    },
+  },
+  {
+    ruleId: 'CIS-1.10',
+    title: 'Restrict Remote Management Access by ACL',
+    description: 'Administrative/VTY access must be restricted to an explicit allow-list of trusted management source addresses, not open to any reachable address.',
+    severity: 'HIGH',
+    cisControl: 'CIS Control 4.4: Implement and Manage a Firewall on Servers',
+    vendors: {
+      cisco_ios: { detectionKeys: ['access-class'], remediationCli: 'ip access-list standard MGMT-ACL\n permit 10.0.0.0 0.0.0.255\nline vty 0 15\n access-class MGMT-ACL in' },
+      cisco_nxos: { detectionKeys: ['access-class'], remediationCli: 'ip access-list MGMT-ACL\n permit ip 10.0.0.0/24 any\nline vty\n access-class MGMT-ACL in' },
+      cisco_xr: { detectionKeys: ['access-class'], remediationCli: 'line default\n access-class ingress MGMT-ACL' },
+      arista: { detectionKeys: ['access-class'], remediationCli: 'ip access-list MGMT-ACL\n permit ip 10.0.0.0/24 any\nline vty\n access-class MGMT-ACL in' },
+      juniper: { detectionKeys: ['firewall filter', 'protect-re'], remediationCli: 'set firewall family inet filter PROTECT-RE term mgmt from source-address 10.0.0.0/24\nset interfaces lo0 unit 0 family inet filter input PROTECT-RE' },
+      fortinet: { detectionKeys: ['trusthost'], remediationCli: 'config system admin\n edit admin\n set trusthost1 10.0.0.0 255.255.255.0\n next\nend' },
+      paloalto: { detectionKeys: ['permitted-ip'], remediationCli: 'set deviceconfig system permitted-ip 10.0.0.0/24' },
+      huawei: { detectionKeys: ['acl', 'user-interface vty'], remediationCli: 'acl 2001\n rule permit source 10.0.0.0 0.0.0.255\nuser-interface vty 0 4\n acl 2001 inbound' },
+      aruba_hpe: { detectionKeys: ['access-list', 'secure-mgmt'], remediationCli: 'ip access-list MGMT-ACL\n permit 10.0.0.0/24\napply access-list ip MGMT-ACL vlan 1 in' },
+      dell_os10: { detectionKeys: ['access-class'], remediationCli: 'ip access-list MGMT-ACL\n permit ip 10.0.0.0/24 any\nline vty\n access-class MGMT-ACL in' },
+      f5_tmsh: { detectionKeys: ['allow-service'], remediationCli: 'modify net self-allow defaults add { tcp:22 }\nmodify sys management-ip-allow add { 10.0.0.0/24 }' },
+      nokia_sros: { detectionKeys: ['management-access-filter'], remediationCli: 'configure system security management-access-filter default-action deny\nconfigure system security management-access-filter entry 1 match src-ip 10.0.0.0/24' },
+      vyos: { detectionKeys: ['firewall', 'source-address'], remediationCli: 'set service ssh listen-address 10.0.0.1\nset firewall name MGMT-IN rule 10 source address 10.0.0.0/24' },
+      extreme_exos: { detectionKeys: ['configure access-list'], remediationCli: 'configure access-list MGMT-ACL 10 permit 10.0.0.0/24' },
+      mikrotik: { detectionKeys: ['/ip service set', 'address='], remediationCli: '/ip service set ssh address=10.0.0.0/24' },
+      generic: { detectionKeys: ['access-class', 'trusthost', 'permitted-ip'], remediationCli: 'Restrict administrative management access to a trusted source-address allow-list.' },
+    },
+  },
+  {
+    ruleId: 'CIS-1.11',
+    title: 'Ensure NTP Time Synchronization is Configured',
+    description: 'Configure an authoritative NTP time source so log timestamps are accurate and correlate correctly across devices during an incident or audit.',
+    severity: 'MEDIUM',
+    cisControl: 'CIS Control 8.4: Standardize Time Synchronization',
+    vendors: {
+      cisco_ios: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1' },
+      cisco_nxos: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1 use-vrf default' },
+      cisco_xr: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1' },
+      arista: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1' },
+      juniper: { detectionKeys: ['system ntp server'], remediationCli: 'set system ntp server 10.0.0.1' },
+      fortinet: { detectionKeys: ['config system ntp'], remediationCli: 'config system ntp\n set ntpsync enable\n set server-mode enable\nend' },
+      paloalto: { detectionKeys: ['ntp-servers'], remediationCli: 'set deviceconfig system ntp-servers primary-ntp-server ntp-server-address 10.0.0.1' },
+      huawei: { detectionKeys: ['ntp-service unicast-server'], remediationCli: 'ntp-service unicast-server 10.0.0.1' },
+      aruba_hpe: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1' },
+      dell_os10: { detectionKeys: ['ntp server'], remediationCli: 'ntp server 10.0.0.1' },
+      f5_tmsh: { detectionKeys: ['ntp servers'], remediationCli: 'modify sys ntp servers add { 10.0.0.1 }' },
+      nokia_sros: { detectionKeys: ['system time ntp'], remediationCli: 'configure system time ntp server 10.0.0.1' },
+      vyos: { detectionKeys: ['system ntp server'], remediationCli: 'set system ntp server 10.0.0.1' },
+      extreme_exos: { detectionKeys: ['configure sntp-client'], remediationCli: 'configure sntp-client primary 10.0.0.1\nenable sntp-client' },
+      mikrotik: { detectionKeys: ['/system ntp client'], remediationCli: '/system ntp client set enabled=yes primary-ntp=10.0.0.1' },
+      generic: { detectionKeys: ['ntp server', 'ntp-service'], remediationCli: 'Configure an authoritative NTP time source.' },
+    },
+  },
 ];
 
 /**
@@ -384,7 +510,56 @@ export function evaluateConfigDeterministically(
           if (!/admintimeout\s+[1-9]/i.test(cleanConfig)) isViolated = true;
         } else if (vendor === 'vyos') {
           if (!/client-timeout\s+[1-9]/i.test(cleanConfig)) isViolated = true;
+        } else {
+          // FIX (new): f5_tmsh / nokia_sros / mikrotik / generic previously
+          // fell through every branch above with isViolated left at its
+          // initial `false` — meaning CIS-1.6 could never be flagged for
+          // those vendors no matter what their config contained. Closed
+          // that gap with the same detectionKeys fallback the other rules
+          // already use for their unmatched vendors.
+          isViolated = !vConfig.detectionKeys.some((k) => new RegExp(k, 'i').test(cleanConfig));
         }
+        break;
+
+      case 'CIS-1.7': // Default SNMP community strings
+        if (vendor.startsWith('cisco') || vendor === 'arista' || vendor === 'dell_os10' || vendor === 'aruba_hpe') {
+          isViolated = /snmp-server\s+community\s+(public|private)\b/i.test(cleanConfig);
+        } else if (vendor === 'juniper' || vendor === 'vyos') {
+          isViolated = /community\s+(public|private)\b/i.test(cleanConfig);
+        } else if (vendor === 'fortinet') {
+          isViolated = /config\s+system\s+snmp\s+community/i.test(cleanConfig) && /\bpublic\b/i.test(cleanConfig);
+        } else if (vendor === 'paloalto') {
+          isViolated = /version\s+v2c/i.test(cleanConfig) || /community.*public/i.test(cleanConfig);
+        } else if (vendor === 'huawei') {
+          isViolated = /snmp-agent\s+community/i.test(cleanConfig) && /\b(public|private)\b/i.test(cleanConfig);
+        } else if (vendor === 'extreme_exos') {
+          isViolated = /snmp\s+community\s+public/i.test(cleanConfig);
+        } else if (vendor === 'mikrotik') {
+          isViolated = /community\s*=\s*public/i.test(cleanConfig) && !/disabled\s*=\s*yes/i.test(cleanConfig);
+        } else {
+          // f5_tmsh / nokia_sros / generic: no community-string config
+          // present at all is not itself a violation of THIS rule (no SNMP
+          // configured ≠ default community string in use), so this rule is
+          // intentionally not flagged for these vendors via a blind
+          // detectionKeys fallback the way CIS-1.1–1.6 do. Left unflagged.
+          isViolated = false;
+        }
+        break;
+
+      case 'CIS-1.8': // Centralized syslog
+        isViolated = !vConfig.detectionKeys.some((k) => new RegExp(k, 'i').test(cleanConfig));
+        break;
+
+      case 'CIS-1.9': // Login/warning banner
+        isViolated = !vConfig.detectionKeys.some((k) => new RegExp(k, 'i').test(cleanConfig));
+        break;
+
+      case 'CIS-1.10': // Management access ACL
+        isViolated = !vConfig.detectionKeys.some((k) => new RegExp(k, 'i').test(cleanConfig));
+        break;
+
+      case 'CIS-1.11': // NTP configured
+        isViolated = !vConfig.detectionKeys.some((k) => new RegExp(k, 'i').test(cleanConfig));
         break;
 
       default:

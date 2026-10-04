@@ -1,10 +1,10 @@
 // C:\Users\hp\aiops-securewatch\dashboard\app\api\scan\route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseAdmin } from '@/lib/supabase';
-import { 
-  evaluateConfigDeterministically, 
-  detectVendor, 
-  ValidatedFinding 
+import {
+  evaluateConfigDeterministically,
+  detectVendor,
+  ValidatedFinding
 } from '@/lib/cisBenchmarks';
 import { sanitizeConfig } from '@/lib/sanitizer';
 import { scanForPromptInjection, wrapUntrustedContent } from '@/lib/security';
@@ -49,8 +49,8 @@ function isInvalidConfig(cfg?: string | null): boolean {
  * Calls Groq/Llama for qualitative summary and recommendations.
  */
 async function performLlmAnalysis(
-  rawConfig: string, 
-  hostname: string, 
+  rawConfig: string,
+  hostname: string,
   vendor: string,
   findings: ValidatedFinding[]
 ): Promise<LlmAnalysisResult> {
@@ -62,8 +62,8 @@ async function performLlmAnalysis(
 
     try {
       const sanitized = sanitizeConfig(rawConfig);
-      const truncatedConfig = sanitized.length > 12000 
-        ? sanitized.slice(0, 12000) + '\n...[TRUNCATED FOR LENGTH]...' 
+      const truncatedConfig = sanitized.length > 12000
+        ? sanitized.slice(0, 12000) + '\n...[TRUNCATED FOR LENGTH]...'
         : sanitized;
 
       const compressedFindings = findings.slice(0, 15).map(f => ({
@@ -86,7 +86,16 @@ async function performLlmAnalysis(
             {
               role: 'system',
               content:
-                'You are a Principal Network Security Architect. Analyze the device configuration and static CIS audit findings. Provide a concise, high-impact Executive Summary (2-3 sentences analyzing systemic risk) and 3-5 vendor-specific hardening recommendations. Return ONLY valid JSON with keys: "summary" (string), "recommendations" (string array), and "riskLevel" ("CRITICAL"|"HIGH"|"MEDIUM"|"LOW").',
+                'You are a Principal Network Security Architect. Analyze the device configuration and static CIS audit findings. Provide a concise, high-impact Executive Summary (2-3 sentences analyzing systemic risk) and 3-5 vendor-specific hardening recommendations. Return ONLY valid JSON with keys: "summary" (string), "recommendations" (string array), and "riskLevel" ("CRITICAL"|"HIGH"|"MEDIUM"|"LOW"). ' +
+                // FIX (real bug, confirmed by hand): the model recommended
+                // "removing VLAN 999 from the trunk allowed-vlan list" on a
+                // config where VLAN 999 was never in any trunk's allowed
+                // list — it only appears as the access VLAN on one shut-down
+                // port, which is the correct, standard way to park an unused
+                // port, not a finding. The model pattern-matched on "unused
+                // VLANs on trunks are bad" instead of reading the literal
+                // config it was given.
+                'Every claim and recommendation must be grounded strictly in the literal text of the running-configuration provided below — never state that a VLAN, interface, ACL, or feature appears somewhere in the config unless you can point to the exact line. Before recommending that a VLAN be removed from a trunk\'s allowed-vlan list, re-read that trunk interface\'s own "switchport trunk allowed vlan" line and confirm the VLAN number is actually present in it. If a port is administratively shut down and assigned to an otherwise-unused VLAN, that is a standard hardening pattern (a "blackhole" VLAN) — do not flag it as a gap.',
             },
             {
               role: 'user',
@@ -106,7 +115,7 @@ async function performLlmAnalysis(
         const data = await response.json();
         let rawContent = data.choices[0]?.message?.content || '{}';
         rawContent = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
-        
+
         try {
           const content = JSON.parse(rawContent);
           return {
@@ -159,10 +168,10 @@ export async function POST(req: NextRequest) {
         .select('*')
         .eq('id', deviceId)
         .maybeSingle();
-        
+
       if (devData) {
         device = devData;
-        
+
         // Priority 1: Check device record columns
         if (isInvalidConfig(rawConfig)) {
           const directConfig = devData.last_config || devData.raw_config || devData.config;
@@ -181,12 +190,12 @@ export async function POST(req: NextRequest) {
           .order('created_at', { ascending: false })
           .limit(1)
           .maybeSingle();
-          
+
         if (latestConfig) {
-          rawConfig = latestConfig.raw_config || 
-                     latestConfig.content || 
-                     latestConfig.config || 
-                     latestConfig.running_config || 
+          rawConfig = latestConfig.raw_config ||
+                     latestConfig.content ||
+                     latestConfig.config ||
+                     latestConfig.running_config ||
                      latestConfig.configuration || '';
           configurationId = latestConfig.id;
         }
@@ -252,7 +261,7 @@ export async function POST(req: NextRequest) {
     const overallRisk = getHighestRiskLevel(cisFloorRisk, aiAnalysis.llmRiskLevel || 'LOW');
     const riskBadge = overallRisk === 'CRITICAL' ? '🔴 CRITICAL' : overallRisk === 'HIGH' ? '🟠 HIGH' : overallRisk === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
 
-    const formattedMarkdownSummary = 
+    const formattedMarkdownSummary =
 `### 🛡️ Device Assessment Overview
 * **Hostname:** ${device.hostname}
 * **OS / Vendor:** \`${vendorType}\`
@@ -268,8 +277,8 @@ export async function POST(req: NextRequest) {
 
 ### 🚨 CIS Benchmark Violations (${validatedFindings.length})
 
-${validatedFindings.length > 0 
-  ? validatedFindings.map((f: ValidatedFinding) => 
+${validatedFindings.length > 0
+  ? validatedFindings.map((f: ValidatedFinding) =>
 `**[${f.severity}] ${f.ruleId} — ${f.title}**
 * **Framework Mapping:** ${f.cisControl || 'CIS Control Baseline'}
 * **Risk Detail:** ${f.description}
@@ -378,7 +387,7 @@ ${aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${
         try {
           await supabase
             .from('devices')
-            .update({ 
+            .update({
               risk_level: overallRisk,
               last_config: rawConfig,
             })
