@@ -38,6 +38,42 @@ function normalizeRiskLevel(val?: string): RiskLevel {
   return 'LOW';
 }
 
+/**
+ * FIX (hallucination ceiling): the hybrid calculation used to be
+ * max(deterministic CIS floor, AI self-rated risk) with nothing else —
+ * that stops the AI from UNDER-rating a config (it can never go below
+ * the floor), but did nothing to stop it from OVER-rating one. An AI
+ * that hallucinates "CRITICAL" on a config whose actual static findings
+ * only justify LOW would previously flow straight through to the
+ * Inventory tab unchecked.
+ *
+ * This clamps the AI's own contribution to at most one severity step
+ * above the deterministic floor. The AI can still raise the risk above
+ * the floor — it may have spotted something real that the static CIS
+ * ruleset doesn't cover — but it can no longer single-handedly jump a
+ * device from LOW to CRITICAL on self-rating alone. Every time this
+ * clamp actually fires, it's logged and surfaced in the API response
+ * (aiAnalysis.riskWasClamped) rather than silently corrected, so it's
+ * visible during testing and explainable in a viva.
+ */
+function clampAiRiskToFloor(
+  aiRisk: RiskLevel,
+  floorRisk: RiskLevel
+): { clamped: RiskLevel; wasClamped: boolean } {
+  const floorRank = RISK_RANKS[floorRisk] ?? 1;
+  const aiRank = RISK_RANKS[aiRisk] ?? 1;
+  const ceilingRank = Math.min(4, floorRank + 1);
+
+  if (aiRank <= ceilingRank) {
+    return { clamped: aiRisk, wasClamped: false };
+  }
+
+  const rankToLevel = (rank: number): RiskLevel =>
+    (Object.keys(RISK_RANKS) as RiskLevel[]).find((k) => RISK_RANKS[k] === rank) || 'LOW';
+
+  return { clamped: rankToLevel(ceilingRank), wasClamped: true };
+}
+
 /** Checks if a config string is empty, null, or contains only exclamation marks/whitespace */
 function isInvalidConfig(cfg?: string | null): boolean {
   if (!cfg || typeof cfg !== 'string') return true;
@@ -268,8 +304,20 @@ export async function POST(req: NextRequest) {
     // 2. Fetch qualitative executive summary & recommendations from LLM
     const aiAnalysis = await performLlmAnalysis(sanitizedPayload, device.hostname, vendorType, validatedFindings);
 
-    // 3. Enforce Hybrid Risk Calculation
-    const overallRisk = getHighestRiskLevel(cisFloorRisk, aiAnalysis.llmRiskLevel || 'LOW');
+    // 3. Enforce Hybrid Risk Calculation: deterministic floor, then clamp
+    // the AI's own self-rating so it can't inflate the result unchecked
+    // (see clampAiRiskToFloor above).
+    const rawAiRiskLevel = aiAnalysis.llmRiskLevel || 'LOW';
+    const { clamped: clampedAiRiskLevel, wasClamped: riskWasClamped } = clampAiRiskToFloor(
+      rawAiRiskLevel,
+      cisFloorRisk
+    );
+    if (riskWasClamped) {
+      console.warn(
+        `[!] AI self-rated risk (${rawAiRiskLevel}) exceeded the deterministic floor (${cisFloorRisk}) by more than one level for device ${deviceId}; clamped to ${clampedAiRiskLevel}.`
+      );
+    }
+    const overallRisk = getHighestRiskLevel(cisFloorRisk, clampedAiRiskLevel);
     const riskBadge = overallRisk === 'CRITICAL' ? '🔴 CRITICAL' : overallRisk === 'HIGH' ? '🟠 HIGH' : overallRisk === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
 
     const formattedMarkdownSummary =
@@ -277,7 +325,7 @@ export async function POST(req: NextRequest) {
 * **Hostname:** ${device.hostname}
 * **OS / Vendor:** \`${vendorType}\`
 * **Static Findings:** ${validatedFindings.length} Benchmark Rules Violated
-* **Overall Risk Rating:** ${riskBadge}${injectionCheck.flagged ? '\n* **⚠️ Integrity Alert:** This configuration contains text matching prompt-injection signatures. It was still fully audited below; treat this device as a priority for manual review, since the match itself can indicate tampering.' : ''}
+* **Overall Risk Rating:** ${riskBadge}${riskWasClamped ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device as **${rawAiRiskLevel}**, which was more than one level above what the static findings justify. The displayed rating was capped to **${overallRisk}**, the highest level the static evidence currently supports.` : ''}${injectionCheck.flagged ? '\n* **⚠️ Integrity Alert:** This configuration contains text matching prompt-injection signatures. It was still fully audited below; treat this device as a priority for manual review, since the match itself can indicate tampering.' : ''}
 
 ---
 
@@ -429,6 +477,12 @@ ${aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${
       dbWarning,
       aiAnalysis: {
         riskLevel: overallRisk,
+        // FIX: surfaced so the UI (and you, in a viva) can show exactly
+        // what the AI said on its own vs. what was actually displayed,
+        // instead of the clamp being an invisible server-side detail.
+        rawAiRiskLevel,
+        cisFloorRisk,
+        riskWasClamped,
         summary: aiAnalysis.summary,
         recommendations: aiAnalysis.recommendations,
         rawFindings: validatedFindings,

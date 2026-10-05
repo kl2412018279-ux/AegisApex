@@ -23,7 +23,10 @@ interface DeviceRecord {
 interface FirmwareAnalysis {
   riskLevel: RiskLevel;
   summary: string;
-  cves: string[];
+  // FIX (Fix C): now carries each verified CVE's real NVD description
+  // alongside its id, instead of just the bare id string, so the UI can
+  // show ground-truth impact text rather than only the AI's own narrative.
+  cves: VerifiedCve[];
   recommendations: string[];
   // NEW: previously these two values were never produced by the AI at all —
   // they were hardcoded three layers downstream (useDashboard.ts's
@@ -55,7 +58,12 @@ function normalizeRiskLevel(val?: string): RiskLevel {
   return 'MEDIUM';
 }
 
-function getDeterministicFirmwareRisk(rawVersion: string, cves: string[] = []): RiskLevel {
+// FIX (TS2345): this only ever reads cves.length, never an element's
+// shape, so it doesn't need to care whether it's called with the old
+// string[] (offline vendor fallback) or the new VerifiedCve[] (live Groq
+// path, see Fix C) — widened to `{ length: number }` so both call sites
+// type-check without needing two near-duplicate functions.
+function getDeterministicFirmwareRisk(rawVersion: string, cves: { length: number } = []): RiskLevel {
   const versionLower = rawVersion.toLowerCase();
 
   if (
@@ -133,7 +141,68 @@ const VENDOR_CPE_HINTS: Record<VendorType, string[]> = {
   generic: [],
 };
 
-async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType): Promise<string[]> {
+// FIX (Fix B, accepted as a heuristic mitigation, not a complete fix):
+// NVD's structured CPE data for a CVE often only encodes the SOFTWARE
+// family (e.g. cisco:ios_xe_software), not which HARDWARE line it
+// affects. A CVE that only affects ASR/ISR routers running IOS-XE can
+// still pass the CPE platform check above for a Catalyst switch also
+// running IOS-XE, because NVD's own structured data doesn't distinguish
+// hardware lines — that part is a genuine data gap, not something more
+// code alone can fully close.
+//
+// What IS fixable: NVD's free-text description for a CVE usually DOES
+// name the specific hardware line in prose (e.g. "Cisco ASR 1000 Series
+// Aggregation Services Routers"). So this cross-checks that description
+// text against the device's own detected hardware family (read from its
+// real "show version" output) and drops the CVE if the description
+// explicitly names a DIFFERENT family and never mentions the device's
+// own family. Built per-vendor, multi-vendor-safe: a vendor with no
+// entry here (or an unidentified device family) is exempted entirely —
+// same fail-open philosophy as VENDOR_CPE_HINTS above, and no vendor is
+// special-cased in the code path itself.
+const VENDOR_HARDWARE_FAMILIES: Partial<Record<VendorType, string[][]>> = {
+  cisco_ios: [
+    ['catalyst'],
+    ['asr'],
+    ['isr', 'integrated services router'],
+    ['small business', 'sf200', 'sg200', 'sf300', 'sg300', 'sf500', 'sg500', 'rv1', 'rv2', 'rv3'],
+    ['nexus'],
+  ],
+  // Other vendors aren't yet a confirmed instance of this exact failure
+  // mode in testing. Left unset (safe no-op) rather than guessed at —
+  // add an entry here only once a real same-OS-different-hardware case
+  // is observed for that vendor, the same way this one was.
+};
+
+/** Finds which hardware-family bucket a device's own version text matches, or -1 if none. */
+function detectHardwareFamily(rawVersionText: string, families: string[][]): number {
+  const lower = (rawVersionText || '').toLowerCase();
+  for (let i = 0; i < families.length; i++) {
+    if (families[i].some((kw) => lower.includes(kw))) return i;
+  }
+  return -1;
+}
+
+// FIX (Fix C): previously only the CVE *ID* survived verification — the
+// AI's own plain-English narrative of each CVE's impact (in its
+// `summary`) was never checked against anything, so a real,
+// platform-correct CVE ID could still carry an exaggerated description
+// (e.g. calling a command-authorization-bypass "remote code execution")
+// with nothing to catch it. NVD's own `descriptions[].value` text is
+// already being fetched during the existence check below — this now
+// keeps it and returns it alongside each verified CVE, so the UI can
+// show the real, verified NVD description directly instead of relying
+// solely on the AI's unverified narrative.
+export interface VerifiedCve {
+  id: string;
+  nvdDescription: string | null;
+}
+
+async function verifyCvesAgainstNvd(
+  candidates: string[],
+  vendorType: VendorType,
+  deviceRawVersion: string
+): Promise<VerifiedCve[]> {
   const CVE_RE = /^CVE-\d{4}-\d{4,7}$/i;
   const syntacticallyValid = Array.from(
     new Set(
@@ -149,7 +218,7 @@ async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType
   // model ever returns more than this, something else is already wrong
   // with that response and isn't worth burning the rate limit on.
   const toCheck = syntacticallyValid.slice(0, 8);
-  const verified: string[] = [];
+  const verified: VerifiedCve[] = [];
   const platformHints = VENDOR_CPE_HINTS[vendorType] || [];
 
   for (const cveId of toCheck) {
@@ -167,8 +236,9 @@ async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType
       }
       if (!res.ok) {
         // Rate-limited or NVD-side error — can't confirm either way, so
-        // don't penalize the candidate for an availability problem.
-        verified.push(cveId);
+        // don't penalize the candidate for an availability problem. No
+        // real description available either, since the fetch itself failed.
+        verified.push({ id: cveId, nvdDescription: null });
         continue;
       }
       const data = await res.json();
@@ -177,6 +247,15 @@ async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType
         console.warn(`[!] Dropping unverifiable CVE from AI output (no NVD record): ${cveId}`);
         continue;
       }
+
+      // Fix C: pull NVD's own real description once, reused below both
+      // for the hardware-family check and as the verified return value —
+      // this is what the UI should show instead of trusting the AI's own
+      // unverified narrative about this CVE's impact.
+      const nvdDescriptions = record?.cve?.descriptions;
+      const nvdDescription: string | null = Array.isArray(nvdDescriptions)
+        ? (nvdDescriptions.find((d: any) => d?.lang === 'en')?.value || null)
+        : null;
 
       // Platform relevance check (see doc comment above). Walk every
       // cpeMatch criteria string in every config node and require at least
@@ -206,11 +285,36 @@ async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType
         // entry for missing metadata it never had.
       }
 
-      verified.push(cveId);
+      // Fix B: hardware-family cross-check against the CVE's own
+      // free-text description (see doc comment above verifyCvesAgainstNvd).
+      const hwFamilies = VENDOR_HARDWARE_FAMILIES[vendorType];
+      if (hwFamilies && hwFamilies.length > 0) {
+        const deviceFamilyIdx = detectHardwareFamily(deviceRawVersion, hwFamilies);
+        if (deviceFamilyIdx !== -1 && nvdDescription) {
+          const descLower = nvdDescription.toLowerCase();
+          const namesOwnFamily = hwFamilies[deviceFamilyIdx].some((kw) => descLower.includes(kw));
+          const namesOtherFamily = hwFamilies.some(
+            (fam, idx) => idx !== deviceFamilyIdx && fam.some((kw) => descLower.includes(kw))
+          );
+          if (namesOtherFamily && !namesOwnFamily) {
+            console.warn(
+              `[!] Dropping ${cveId} as a hardware-family mismatch for ${vendorType} — NVD description names a different hardware line than this device. Excerpt: ${nvdDescription.slice(0, 150)}`
+            );
+            continue;
+          }
+        }
+        // Either no usable description text, it's silent on hardware
+        // family either way, or the device's own family couldn't be
+        // identified from its version text — can't confirm OR deny, so
+        // fail open rather than guessing.
+      }
+
+      verified.push({ id: cveId, nvdDescription });
     } catch (err) {
-      // Network/timeout failure — fail open, see doc comment above.
+      // Network/timeout failure — fail open, see doc comment above. No
+      // description available since the fetch itself never completed.
       console.warn(`[!] NVD verification unreachable for ${cveId}, keeping candidate as unconfirmed:`, err);
-      verified.push(cveId);
+      verified.push({ id: cveId, nvdDescription: null });
     }
   }
 
@@ -503,7 +607,7 @@ async function analyzeFirmwareWithGroq(
         // AND that its recorded CPE data actually names this platform
         // family — before trusting it. See verifyCvesAgainstNvd doc
         // comment above for why both checks are needed.
-        const cves = await verifyCvesAgainstNvd(rawCves, vendorType);
+        const cves = await verifyCvesAgainstNvd(rawCves, vendorType, rawVersion);
 
         const staticFloor = getDeterministicFirmwareRisk(rawVersion, cves);
         const finalRisk = getHighestRiskLevel(staticFloor, parsedLLMRisk);
@@ -547,7 +651,11 @@ async function analyzeFirmwareWithGroq(
   return {
     riskLevel: fallbackRisk,
     summary: fallback.summary,
-    cves: fallback.cves,
+    // Offline/static fallback entries are fixed, known-good CVE IDs we
+    // wrote by hand (not AI output), but they still weren't looked up
+    // against NVD at request time, so there's no live description to
+    // attach here — nvdDescription is null rather than fabricated.
+    cves: fallback.cves.map((id) => ({ id, nvdDescription: null })),
     recommendations: fallback.recommendations,
     targetFirmware: fallback.targetFirmware,
     eolStatus: fallback.eolStatus,
@@ -622,7 +730,12 @@ export async function POST(req: NextRequest) {
 
 ${
   analysis.cves.length > 0
-    ? analysis.cves.map((c: string) => `* ⚠️ **${c}**`).join('\n')
+    // FIX (Fix C): show NVD's own verified description under each CVE
+    // instead of only the AI's unverified narrative claim about it — this
+    // is the actual ground-truth text, not a paraphrase.
+    ? analysis.cves
+        .map((c) => `* ⚠️ **${c.id}** — ${c.nvdDescription || '_No NVD description available for this CVE (lookup failed or record is sparse); verify manually before treating as confirmed impact._'}`)
+        .join('\n')
     : '✅ *No critical baseline CVE matches identified for this OS image.*'
 }
 
@@ -724,7 +837,17 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
       content: formattedMarkdownSummary,
       text: formattedMarkdownSummary,
       result: formattedMarkdownSummary,
-      cves: analysis.cves,
+      // FIX: kept as plain string[] for backward compatibility with
+      // whatever already reads data.cves (e.g. VersionTab.tsx) expecting
+      // bare CVE ID strings — changing this shape without seeing that
+      // file's current code could silently break its rendering (a mapped
+      // object would show as "[object Object]"). The new verified
+      // descriptions (Fix C) are additive, in cveDetails below.
+      cves: analysis.cves.map((c) => c.id),
+      // NEW (Fix C): each verified CVE's real NVD description alongside
+      // its id — use this in the UI instead of cves[] wherever you want
+      // to show ground-truth impact text rather than just the bare ID.
+      cveDetails: analysis.cves,
       aiAnalysis: analysis,
       // NEW: these two are what useDashboard.ts's handleAnalyzeFirmware()
       // was already trying to read (data.targetFirmware / data.eolStatus) —
