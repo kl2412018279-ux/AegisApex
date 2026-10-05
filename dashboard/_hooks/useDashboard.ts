@@ -470,7 +470,27 @@ export function useDashboard() {
     setScanProgress({ current: 0, total: devices.length });
 
     try {
-      const scanPromises = devices.map(async (dev) => {
+      // FIX (race, same one handleRunScan already fixed): this used to fire
+      // /api/scan and /api/analyze-firmware AT THE SAME TIME for each
+      // device (Promise.all). For a device with no scans row yet, both saw
+      // "no row", so each created its own scans row - two rows per device,
+      // the Version and Config data split between them. Now, per device:
+      // firmware first, then re-read the latest scan row, then /api/scan
+      // updates that same row.
+      //
+      // Devices also run one after another now (not all at once). Each
+      // device costs 2 Groq calls; running 6+ devices in parallel was a
+      // burst of 12+ calls at once, which is how you get Groq 503/429.
+      const results: Array<{
+        id: string;
+        hostname: string;
+        ip: string;
+        configText: string;
+        firmwareText: string;
+        riskLevel: string;
+      }> = [];
+
+      for (const dev of devices) {
         const { data: scanData } = await supabase
           .from('scans')
           .select('*')
@@ -492,36 +512,39 @@ export function useDashboard() {
 
         const versionContent = dev.raw_version || (dev as any).os_version || latestScanRecord?.raw_version || '';
 
-        const [configRes, firmwareRes] = await Promise.all([
-          fetch('/api/scan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              deviceId: dev.id,
-              // FIX: same gap as handleRunScan above — this bulk path never
-              // passed scanId either, so every "Scan All Inventory" run
-              // forked a brand-new scans row per device instead of updating
-              // the existing one, stranding any target_firmware/eol_status
-              // the paired /api/analyze-firmware call (below) had just
-              // written to the old row.
-              scanId: latestScanRecord?.id || null,
-              vendor: dev.vendor || 'Cisco',
-              rawConfig: configContent,
-              rawVersion: versionContent,
-              configurationId: latestScanRecord?.configuration_id || null,
-            }),
-          }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        // 1) firmware first (it may create the device's first scans row)
+        const firmwareRes = await fetch('/api/analyze-firmware', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: dev.id,
+            vendor: dev.vendor || 'Cisco',
+            rawVersion: versionContent,
+          }),
+        }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
 
-          fetch('/api/analyze-firmware', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              deviceId: dev.id,
-              vendor: dev.vendor || 'Cisco',
-              rawVersion: versionContent,
-            }),
-          }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
-        ]);
+        // 2) re-read the latest row AFTER firmware ran
+        const { data: refreshedScans } = await supabase
+          .from('scans')
+          .select('id, configuration_id')
+          .eq('device_id', dev.id)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        const refreshedScan = refreshedScans && refreshedScans.length > 0 ? refreshedScans[0] : null;
+
+        // 3) config scan updates that same row
+        const configRes = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: dev.id,
+            scanId: refreshedScan?.id || latestScanRecord?.id || null,
+            vendor: dev.vendor || 'Cisco',
+            rawConfig: configContent,
+            rawVersion: versionContent,
+            configurationId: refreshedScan?.configuration_id || latestScanRecord?.configuration_id || null,
+          }),
+        }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
 
         const configText = configRes?.output || configRes?.summary || '';
         const firmwareText = firmwareRes?.output || firmwareRes?.osSummary || firmwareRes?.summary || '';
@@ -529,17 +552,15 @@ export function useDashboard() {
 
         setScanProgress((prev) => ({ ...prev, current: prev.current + 1 }));
 
-        return {
+        results.push({
           id: dev.id,
           hostname: dev.hostname,
           ip: dev.ip_address,
           configText,
           firmwareText,
           riskLevel: computedDevRisk,
-        };
-      });
-
-      const results = await Promise.all(scanPromises);
+        });
+      }
 
       const newCache: Record<string, AiCacheEntry> = {};
 
