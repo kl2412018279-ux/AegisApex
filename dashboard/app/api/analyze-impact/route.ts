@@ -13,6 +13,7 @@ interface ImpactAnalysisResult {
   disruptionRisk: DisruptionRisk;
   analysis: string;
   rollbackCommands: string[];
+  narrative?: string;
 }
 
 function normalizeImpactLevel(val?: string): ImpactLevel {
@@ -86,6 +87,57 @@ function generateSmartRollback(cliCommand: string, vendor: string = 'generic'): 
     : ['! Manual configuration inspection required for rollback.'];
 }
 
+const IMPACT_RANKS: Record<ImpactLevel, number> = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+
+function higherOf(a: ImpactLevel, b: ImpactLevel): ImpactLevel {
+  return IMPACT_RANKS[a] >= IMPACT_RANKS[b] ? a : b;
+}
+
+/**
+ * NEW: deterministic minimum impact, same idea as the "floor" on the Config
+ * and Version tabs. Plain keyword rules, no AI, vendor-agnostic (these words
+ * mean the same thing on every CLI this system supports). The AI can rate
+ * a command HIGHER than this, but never lower, so a command that can cut
+ * access or reboot a device can never be shown as LOW because the AI was
+ * wrong or offline.
+ */
+function getDeterministicImpactFloor(cliCommand: string): ImpactLevel {
+  const lines = cliCommand.split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean);
+  let floor: ImpactLevel = 'LOW';
+
+  for (const line of lines) {
+    // CRITICAL: reboots / wipes - service down or config lost
+    if (
+      /\b(reload|reboot|erase|zeroize|factory[- ]?reset)\b/.test(line) ||
+      /^format\b/.test(line) ||
+      /^delete\s+(\/force\s+)?(flash|bootflash|nvram|startup|disk)/.test(line)
+    ) {
+      return 'CRITICAL';
+    }
+
+    // HIGH: can lock you out of the device or drop a link
+    if (
+      /^no\s+(aaa\s+new-model|ip\s+ssh|ssh\b|username\b|enable\b)/.test(line) ||
+      /^transport\s+input\s+(none|telnet)/.test(line) ||
+      /^no\s+transport\s+input/.test(line) ||
+      /^shutdown$/.test(line) ||
+      /\baccess-class\b/.test(line)
+    ) {
+      floor = higherOf(floor, 'HIGH');
+      continue;
+    }
+
+    // MEDIUM: routing / ACL / addressing / VLAN changes can interrupt traffic
+    if (
+      /^(no\s+)?(ip\s+route|ip\s+address|ip\s+access-list|access-list|vlan\b|spanning-tree|router\s+\w+|snmp-server|ntp\b)/.test(line) ||
+      /default-gateway/.test(line)
+    ) {
+      floor = higherOf(floor, 'MEDIUM');
+    }
+  }
+  return floor;
+}
+
 /**
  * Standardizes output markdown layout for UI rendering.
  */
@@ -141,18 +193,25 @@ ${rollbackBlock}
 
 function fallbackImpactAnalysis(cliCommand: string, vendor?: string): ImpactAnalysisResult {
   const cmdLower = cliCommand.toLowerCase().trim();
+  // FIX: used to be .includes('shutdown'), which also matched the SAFE
+  // command "no shutdown" and rated it HIGH/CRITICAL. Now matches a line
+  // that IS "shutdown" only.
   const isDestructive =
     cmdLower.includes('reload') ||
     cmdLower.includes('reboot') ||
-    cmdLower.includes('shutdown') ||
+    cmdLower.split('\n').some((l) => l.trim() === 'shutdown') ||
     cmdLower.includes('delete') ||
     cmdLower.includes('erase');
 
   const rollbackCommands = generateSmartRollback(cliCommand, vendor);
 
+  // FIX: the old text said "Standard Operations Command. Low probability of
+  // core network disruption" for ANY command without a few keywords, even
+  // though no AI had looked at it. It is now labelled as what it is: a
+  // keyword check, shown only when the AI service is unavailable.
   const narrative = isDestructive
-    ? '⚠️ **High Risk Operation Detected.** Executing this command will cause immediate service interruption or interface down states on active connections.'
-    : '✅ **Standard Operations Command.** Low probability of core network disruption. Verify service availability after apply.';
+    ? '⚠️ **AI service unavailable - keyword check only.** This command contains a disruptive keyword (reload / reboot / shutdown / delete / erase) and may interrupt service.'
+    : '⚠️ **AI service unavailable - keyword check only.** No disruptive keyword was found, but no AI review was done. Review the command manually before applying. Click Analyze again to retry.';
 
   const formattedAnalysis = buildFormattedMarkdown(
     vendor || 'Generic Device',
@@ -167,6 +226,7 @@ function fallbackImpactAnalysis(cliCommand: string, vendor?: string): ImpactAnal
     disruptionRisk: isDestructive ? 'CRITICAL' : 'LOW',
     analysis: formattedAnalysis,
     rollbackCommands,
+    narrative,
   };
 }
 
@@ -223,24 +283,52 @@ STRICT ROLLBACK RULES:
 
         const userPrompt = `Vendor OS: ${vendorName}\n\nRunning Configuration Context:\n${configContext}\n\nProposed CLI Command:\n${cliCommand}`;
 
-        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: GROQ_MODEL,
-            response_format: { type: 'json_object' },
-            temperature: 0.1,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-          }),
-        });
+        const callGroq = (model: string) =>
+          fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${GROQ_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model,
+              response_format: { type: 'json_object' },
+              temperature: 0.1,
+              // FIX: same as the other two routes - gpt-oss is a reasoning
+              // model and can use its whole token budget thinking, then
+              // return an empty answer. Cap the thinking, guarantee room.
+              ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
+              max_tokens: 2048,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+              ],
+            }),
+          });
 
-        if (groqRes.ok) {
+        // FIX: Groq sometimes answers 503 "over capacity" or 429. That used
+        // to be ignored with no log and no retry. Now: main model, wait and
+        // retry, then a second model, logging every failed attempt.
+        const GROQ_ATTEMPTS = [GROQ_MODEL, GROQ_MODEL, 'llama-3.3-70b-versatile'];
+        let groqRes: Response | null = null;
+        for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
+          try {
+            groqRes = await callGroq(GROQ_ATTEMPTS[i]);
+          } catch (e) {
+            groqRes = null;
+            console.warn(`[!] Groq impact attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) failed:`, e);
+          }
+          if (groqRes && groqRes.ok) break;
+          if (groqRes) {
+            const errBody = await groqRes.clone().text().catch(() => '');
+            console.warn(`[!] Groq impact attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${groqRes.status}: ${errBody.slice(0, 200)}`);
+          }
+          if (i < GROQ_ATTEMPTS.length - 1) {
+            await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+          }
+        }
+
+        if (groqRes && groqRes.ok) {
           const groqData = await groqRes.json();
           const rawContent = (groqData.choices[0]?.message?.content || '{}')
             .replace(/```json/g, '')
@@ -255,19 +343,26 @@ STRICT ROLLBACK RULES:
 
     const fallback = fallbackImpactAnalysis(cliCommand, vendorName);
 
-    const finalImpactLevel = parsedResult?.impactLevel
-      ? normalizeImpactLevel(parsedResult.impactLevel)
-      : fallback.impactLevel;
+    const usedFallback = !parsedResult;
+    const commandFloor = getDeterministicImpactFloor(cliCommand);
 
-    const finalDisruptionRisk = parsedResult?.disruptionRisk
-      ? normalizeDisruptionRisk(parsedResult.disruptionRisk)
-      : fallback.disruptionRisk;
+    // The AI answer (or the keyword fallback) can never go BELOW the
+    // deterministic floor for this command.
+    const finalImpactLevel = higherOf(
+      commandFloor,
+      parsedResult?.impactLevel ? normalizeImpactLevel(parsedResult.impactLevel) : fallback.impactLevel
+    );
+
+    const finalDisruptionRisk = higherOf(
+      commandFloor,
+      parsedResult?.disruptionRisk ? normalizeDisruptionRisk(parsedResult.disruptionRisk) : fallback.disruptionRisk
+    );
 
     const rawRollback = Array.isArray(parsedResult?.rollbackCommands) && parsedResult.rollbackCommands.length > 0
       ? parsedResult.rollbackCommands
       : fallback.rollbackCommands;
 
-    const rawNarrative = parsedResult?.analysis || 'CLI operational impact analysis completed.';
+    const rawNarrative = parsedResult?.analysis || fallback.narrative || 'CLI operational impact analysis completed.';
 
     // Construct unified Markdown payload
     const formattedMarkdown = buildFormattedMarkdown(
@@ -288,6 +383,8 @@ STRICT ROLLBACK RULES:
       summary: formattedMarkdown,
       rollbackCommands: rawRollback,
       // FIX: surfaced instead of silently 422-ing the request (see note above)
+      aiUnavailable: usedFallback,
+      deterministicFloor: commandFloor,
       promptInjectionFlagged: commandScan.flagged || configScan.flagged,
       promptInjectionSource: commandScan.flagged && configScan.flagged
         ? 'command_and_config'

@@ -41,6 +41,8 @@ interface FirmwareAnalysis {
   // directly, same as it already does for cves/recommendations.
   targetFirmware: string;
   eolStatus: string;
+  // true when Groq could not be reached/used and the offline table answered.
+  usedFallback?: boolean;
 }
 
 const RISK_RANKS: Record<RiskLevel, number> = {
@@ -640,14 +642,14 @@ async function analyzeFirmwareWithGroq(
 
   if (apiKey) {
     try {
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const callGroq = (model: string) => fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'openai/gpt-oss-120b',
+          model,
           messages: [
             {
               role: 'system',
@@ -705,13 +707,37 @@ async function analyzeFirmwareWithGroq(
           // reasoning pass, and max_tokens guarantees headroom for the
           // actual answer regardless. If this still 400s, the next
           // terminal log will show it and we can tune further.
-          reasoning_effort: 'low',
+          // reasoning_effort is only valid for the gpt-oss reasoning models.
+          ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
           max_tokens: 2048,
           response_format: { type: 'json_object' },
         }),
       });
 
-      if (response.ok) {
+      // FIX (seen in your terminal): Groq answered 503 "over capacity" and
+      // the first failure went straight to the offline table. Now: try the
+      // main model, wait and try it again, then try a second model, before
+      // giving up. Same for 429 / network errors.
+      const GROQ_ATTEMPTS = ['openai/gpt-oss-120b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
+      let response: Response | null = null;
+      for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
+        try {
+          response = await callGroq(GROQ_ATTEMPTS[i]);
+        } catch (e) {
+          response = null;
+          console.warn(`[!] Groq attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) network error:`, e);
+        }
+        if (response && response.ok) break;
+        if (response) {
+          const body = await response.clone().text().catch(() => '');
+          console.warn(`[!] Groq attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${response.status}: ${body.slice(0, 200)}`);
+        }
+        if (i < GROQ_ATTEMPTS.length - 1) {
+          await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+        }
+      }
+
+      if (response && response.ok) {
         const data = await response.json();
         const rawContent = (data.choices[0]?.message?.content || '{}')
           .replace(/```json/g, '')
@@ -769,36 +795,33 @@ async function analyzeFirmwareWithGroq(
         // completely silently — no console output at all, nothing to tell
         // you WHY it fell back to the generic vendor placeholder. This was
         // indistinguishable from "working as intended" in the logs.
-        const errBody = await response.text().catch(() => '<unreadable body>');
-        console.warn(
-          `[!] Groq Firmware AI call returned non-OK status ${response.status} ${response.statusText}. Falling back to vendor defaults. Body: ${errBody.slice(0, 500)}`
-        );
+        console.warn('[!] Groq Firmware AI unavailable after all attempts. Using offline baseline (labelled as such).');
       }
     } catch (err) {
       console.warn('[!] Groq Firmware AI call failed, falling back to vendor defaults:', err);
     }
   }
 
-  const fallbackFloor = getDeterministicFirmwareRisk(rawVersion, fallback.cves);
-  const fallbackRisk = getHighestRiskLevel(fallbackFloor, 'MEDIUM');
+  // FIX: the offline table is a generic baseline, NOT an assessment of this
+  // device. Before, it listed fixed CVE IDs as if they were findings (they
+  // were wrong for newer versions) and told the user to "upgrade" to a
+  // release that can be OLDER than the one installed. Now it reports no
+  // CVEs, gives no version advice, only the raw-version rule floor, and is
+  // clearly labelled so nobody mistakes it for an AI result.
+  const fallbackFloor = getDeterministicFirmwareRisk(rawVersion, []);
 
   return {
-    riskLevel: fallbackRisk,
-    // This offline path never had an AI self-rating to clamp in the first
-    // place ('MEDIUM' above is a fixed placeholder, not a model opinion),
-    // so there's nothing to report as clamped.
-    rawAiRiskLevel: 'MEDIUM',
+    riskLevel: fallbackFloor,
+    rawAiRiskLevel: fallbackFloor,
     staticFloorRisk: fallbackFloor,
     riskWasClamped: false,
-    summary: fallback.summary,
-    // Offline/static fallback entries are fixed, known-good CVE IDs we
-    // wrote by hand (not AI output), but they still weren't looked up
-    // against NVD at request time, so there's no live description to
-    // attach here — nvdDescription is null rather than fabricated.
-    cves: fallback.cves.map((id) => ({ id, nvdDescription: null })),
-    recommendations: fallback.recommendations,
-    targetFirmware: fallback.targetFirmware,
-    eolStatus: fallback.eolStatus,
+    summary:
+      'The AI service was unavailable, so no vulnerability or lifecycle assessment was made for this version. Click "Re-analyze Firmware" to try again.',
+    cves: [],
+    recommendations: fallback.recommendations.filter((r) => !/upgrade|update/i.test(r)),
+    targetFirmware: 'Unavailable (AI offline, retry)',
+    eolStatus: 'Unavailable (AI offline, retry)',
+    usedFallback: true,
   };
 }
 
@@ -871,14 +894,16 @@ export async function POST(req: NextRequest) {
       /upgrade|update/i.test(rec) && VERSION_LIKE_RE.test(rec);
 
     const groundedUpgradeLine = `Upgrade to the vendor's current recommended release, **${analysis.targetFirmware}**, as soon as possible.`;
-    const groundedRecommendations = [
-      groundedUpgradeLine,
-      ...analysis.recommendations.filter((r) => !isVersionSpecificUpgradeLine(r)),
-    ];
+    const groundedRecommendations = analysis.usedFallback
+      ? analysis.recommendations
+      : [
+          groundedUpgradeLine,
+          ...analysis.recommendations.filter((r) => !isVersionSpecificUpgradeLine(r)),
+        ];
 
     const formattedMarkdownSummary =
 `### 🔍 OS/Firmware Security Assessment
-
+${analysis.usedFallback ? '\n> ⚠️ **AI service unavailable (Groq overloaded). This is NOT an assessment of this device. Click "Re-analyze Firmware" to retry.**\n' : ''}
 * **Hostname:** ${hostnameStr}
 * **Vendor / Platform:** \`${vendorType}\`
 * **Evaluated Threat Level:** **${riskBadge}**${analysis.riskWasClamped ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device as **${analysis.rawAiRiskLevel}**, which was more than one level above what the verified findings (CVE count, EOL status) justify. The displayed rating was capped to **${analysis.riskLevel}**, the highest level the evidence currently supports.` : ''}
@@ -895,7 +920,9 @@ export async function POST(req: NextRequest) {
 ### 🚨 Potential Known Vulnerabilities / CVEs (${analysis.cves.length})
 
 ${
-  analysis.cves.length > 0
+  analysis.usedFallback
+    ? '⚠️ *CVE check skipped because the AI service was unavailable.*'
+    : analysis.cves.length > 0
     // FIX (Fix C): show NVD's own verified description under each CVE
     // instead of only the AI's unverified narrative claim about it — this
     // is the actual ground-truth text, not a paraphrase.

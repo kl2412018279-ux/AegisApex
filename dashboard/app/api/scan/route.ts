@@ -128,9 +128,6 @@ async function performLlmAnalysis(
   const apiKey = process.env.GROQ_API_KEY;
 
   if (apiKey) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
     try {
       const sanitized = sanitizeConfig(rawConfig);
       const truncatedConfig = sanitized.length > 12000
@@ -144,7 +141,10 @@ async function performLlmAnalysis(
         description: f.description,
       }));
 
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const callGroq = (model: string) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      return fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         signal: controller.signal,
         headers: {
@@ -152,7 +152,7 @@ async function performLlmAnalysis(
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model:  'openai/gpt-oss-120b',
+          model,
           messages: [
             {
               role: 'system',
@@ -205,13 +205,37 @@ async function performLlmAnalysis(
           // happening on the firmware-analysis endpoint from your
           // terminal log; this endpoint has a shorter prompt so it's less
           // likely to hit it, but the same risk exists).
-          reasoning_effort: 'low',
+          ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
           max_tokens: 2048,
           response_format: { type: 'json_object' },
         }),
       }).finally(() => clearTimeout(timeoutId));
+      };
 
-      if (response.ok) {
+      // FIX: Groq sometimes answers 503 "over capacity" / 429. That used to
+      // be ignored silently (no log) and the generic fallback text was shown.
+      // Now: main model, wait and retry, then a second model, with a log
+      // line for every failed attempt.
+      const GROQ_ATTEMPTS = ['openai/gpt-oss-120b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
+      let response: Response | null = null;
+      for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
+        try {
+          response = await callGroq(GROQ_ATTEMPTS[i]);
+        } catch (e) {
+          response = null;
+          console.warn(`[!] Groq config attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) failed:`, e);
+        }
+        if (response && response.ok) break;
+        if (response) {
+          const body = await response.clone().text().catch(() => '');
+          console.warn(`[!] Groq config attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${response.status}: ${body.slice(0, 200)}`);
+        }
+        if (i < GROQ_ATTEMPTS.length - 1) {
+          await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+        }
+      }
+
+      if (response && response.ok) {
         const data = await response.json();
         let rawContent = data.choices[0]?.message?.content || '{}';
         rawContent = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -234,7 +258,7 @@ async function performLlmAnalysis(
   }
 
   return {
-    summary: `Security assessment completed for target host ${hostname} running ${vendor}. Key control plane vulnerabilities detected.`,
+    summary: `The AI service was unavailable, so this summary is a generic baseline. The CIS rule findings and risk level below come from the rule engine and are still accurate.`,
     recommendations: [
       'Disable unencrypted management services (Telnet/HTTP) across all VRFs.',
       'Enforce SSHv2 protocol restriction and explicit line idle session timeouts.',
@@ -452,7 +476,15 @@ ${
   // that case alone still falls back to the AI's own general recommendations.
   validatedFindings.length > 0
     ? validatedFindings
-        .map((f: ValidatedFinding, idx: number) => `**${idx + 1}.** ${f.title} — \`${f.remediationCli}\``)
+        // Multi-line commands (e.g. "line vty 0 15" + "exec-timeout 10 0")
+        // used to be squeezed into one inline-code span, which broke the
+        // layout. They now go in a proper code block (copyable, keeps the
+        // line breaks); single-line commands stay inline.
+        .map((f: ValidatedFinding, idx: number) =>
+          f.remediationCli.includes('\n')
+            ? `**${idx + 1}.** ${f.title}\n\`\`\`cli\n${f.remediationCli}\n\`\`\``
+            : `**${idx + 1}.** ${f.title} — \`${f.remediationCli}\``
+        )
         .join('\n')
     : aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')
 }`;
