@@ -375,26 +375,40 @@ export function useDashboard() {
       }
 
       try {
+        // FIX (real bug, confirmed by hand, round 2): `scan` was fetched at
+        // the very TOP of this function, BEFORE /api/analyze-firmware ran.
+        // On a device's first-ever successful scan — no `scans` row exists
+        // yet — `scan` is null at that point. /api/analyze-firmware (called
+        // just above) then correctly INSERTS the device's first scans row,
+        // with target_firmware/eol_status populated. But passing the STALE
+        // `scan?.id` (still null) here made /api/scan take its own INSERT
+        // branch instead of updating that just-created row — forking a
+        // second `scans` row with risk_level/summary but no
+        // target_firmware/eol_status at all (scan/route.ts's insert payload
+        // never sets those two columns). fetchScanResults() always reads
+        // the single most-recently-created row, so it picked up this
+        // second, blank-on-those-two-fields row and showed "Not yet
+        // analyzed" even though analyze-firmware's real answer had been
+        // saved correctly seconds earlier, to a different, now-orphaned
+        // row. We now re-fetch the device's current latest scan right
+        // before calling /api/scan, so it always lands on whichever row
+        // /api/analyze-firmware just touched — first-ever run or not —
+        // instead of trusting a value captured before that call happened.
+        const { data: refreshedScans } = await supabase
+          .from('scans')
+          .select('id, configuration_id')
+          .eq('device_id', selectedDevice.id)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        const refreshedScan = refreshedScans && refreshedScans.length > 0 ? refreshedScans[0] : null;
+
         const configRes = await fetch('/api/scan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             deviceId: selectedDevice.id,
-            // FIX: this call never passed scanId, so /api/scan's own
-            // persistence logic always took its INSERT branch — forking a
-            // brand-new `scans` row instead of updating the one the
-            // /api/analyze-firmware call directly above just wrote
-            // target_firmware/eol_status into. That new row became the
-            // "latest" scan by created_at with those two fields empty, so
-            // the very next fetchScanResults() picked up the fresh, blank
-            // row and showed "Not yet analyzed" even though the real AI
-            // answer had been persisted to the database seconds earlier, to
-            // a different, now-orphaned row. Passing scan?.id here makes
-            // /api/scan update that same row instead of forking a duplicate,
-            // so "Run AI Assessment" and "Re-analyze Firmware" now leave the
-            // device in the same state instead of disagreeing.
-            scanId: scan?.id || null,
-            configurationId: scan?.configuration_id || null,
+            scanId: refreshedScan?.id || scan?.id || null,
+            configurationId: refreshedScan?.configuration_id || scan?.configuration_id || null,
             vendor: selectedDevice.vendor || 'Cisco',
             rawConfig: rawConfigContent,
             rawVersion: rawVersionContent,
@@ -745,18 +759,41 @@ export function useDashboard() {
           const targetFw = data.targetFirmware || data.recommendedVersion || data.target_firmware || 'Recommended Baseline Standard';
           const eolState = data.eolStatus || data.lifecycleStatus || data.eol_status || 'Mainstream Active';
 
-          setLatestScan((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  risk_level: unifiedRisk,
-                  os_summary: newOsSummary,
-                  version_info: newOsSummary,
-                  target_firmware: targetFw,
-                  eol_status: eolState,
-                }
-              : null
-          );
+          // FIX (real bug, confirmed by hand): this used to be
+          // `prev ? { ...prev, target_firmware: targetFw, ... } : null` —
+          // if latestScan was still null at the moment this response came
+          // back (first load, or a race with the initial fetchScanResults
+          // effect), the ENTIRE update was discarded and latestScan stayed
+          // null. The AI's real targetFirmware/eolStatus answer was thrown
+          // away silently. VersionTab's top "Recommended LTS Release" card
+          // reads only from latestScan.target_firmware, so it fell straight
+          // through to the hardcoded VENDOR_BASELINE_DISPLAY placeholder
+          // (always "Cisco IOS-XE 17.09.05 LTS") no matter what the AI
+          // said — which is exactly the contradiction between the top card
+          // and the AI analysis panel below it (the panel reads from
+          // aiCache instead, which was never guarded by `prev` and so
+          // always updated correctly). Now we always construct a full
+          // object — synthesizing sane defaults for the other ScanResult
+          // fields when there's no prior scan yet — so the AI's
+          // targetFirmware/eolStatus is never silently dropped.
+          setLatestScan((prev) => ({
+            ...(prev ?? {
+              scanned_at: new Date().toISOString(),
+              raw_config: '',
+              summary: 'No summary available',
+              vulnerabilities: [],
+              model_used: 'Groq Llama-3',
+              raw_version: typeof rawVer === 'string' ? rawVer : '',
+              show_version: typeof rawVer === 'string' ? rawVer : '',
+              os_version: typeof rawVer === 'string' ? rawVer : '',
+              os_cves: [],
+            }),
+            risk_level: unifiedRisk,
+            os_summary: newOsSummary,
+            version_info: newOsSummary,
+            target_firmware: targetFw,
+            eol_status: eolState,
+          }));
 
           setAiCache((prev) => ({
             ...prev,

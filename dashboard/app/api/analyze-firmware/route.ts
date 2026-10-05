@@ -77,27 +77,63 @@ function getDeterministicFirmwareRisk(rawVersion: string, cves: string[] = []): 
   return 'LOW';
 }
 
-// FIX (real bug, confirmed by hand): the LLM would periodically return CVE
-// IDs that are not real for the evaluated platform — either fully invented,
-// or a misattributed ID copied from a different vendor's advisory/report
-// numbering. Concretely: for a Cisco IOS-XE 17.9.5 device, the model once
-// returned CVE-2024-2005, CVE-2024-2006 and CVE-2024-2007 — none of which
-// are Cisco CVEs; CVE-2024-2005 isn't even a CVE at all, it's an unrelated
-// Cisco Talos *vulnerability report* ID (TALOS-2024-2005), misremembered as
-// a CVE number. A CVE list that doesn't survive one NVD search is worse
-// than no CVE list on a security-auditing tool, so every ID the model
-// proposes is now checked against the public NVD REST API before being
-// shown or persisted.
+// FIX (real bug, confirmed by hand, round 2): the previous verification pass
+// only checked "does this CVE ID exist in NVD at all" — it never checked
+// whether the CVE actually applies to the PRODUCT being audited. On a real
+// run against a Catalyst 9300 (IOS-XE 17.9.5), the model returned
+// CVE-2023-20187 (Cisco ASR 1000 routers, L2TP/mLRE DoS — a completely
+// different hardware family) and CVE-2023-20188 / CVE-2023-20189 (Cisco
+// Small Business 200/300/500 series switches' web UI — not Catalyst, not
+// IOS-XE at all). All three are real, NVD-confirmed CVE IDs, so the old
+// existence-only check passed every one of them through. The model is
+// recalling genuine Cisco CVE numbers and misattributing them to the wrong
+// product line — a subtler version of the same hallucination pattern.
 //
-// This is a verification step, not a lookup: the LLM still proposes
-// candidates (no NVD full-text search is performed here, just an exact
-// cveId existence check), we only refuse to surface one NVD doesn't
-// confirm exists.
+// NVD's CVE 2.0 API response includes `configurations[].nodes[].cpeMatch[]`,
+// the actual list of CPE strings (vendor:product:version) the CVE is
+// recorded against. We now also require that at least one cpeMatch
+// criteria string in the response contains a platform keyword for the
+// vendor we detected locally (see VENDOR_CPE_HINTS) — if NONE of the CVE's
+// recorded CPEs mention this platform family at all, it's dropped as a
+// platform mismatch, independent of whether the ID itself is real.
 //
-// Deliberately fails OPEN on a network/timeout/rate-limit error (keeps the
-// candidate as-is) and fails CLOSED only on a confirmed "no such CVE" — an
-// unreachable NVD is not evidence a CVE is fake, but a confirmed 404 is.
-async function verifyCvesAgainstNvd(candidates: string[]): Promise<string[]> {
+// Still fails OPEN when the data needed to judge is simply missing or
+// unreachable (no configurations block on an older/sparse CVE record, or a
+// network/timeout error) — that's "can't confirm," not "confirmed wrong."
+// Only a confirmed NVD 404 (doesn't exist) or a confirmed CPE mismatch
+// (exists, but for a different product) causes a drop.
+const VENDOR_CPE_HINTS: Record<VendorType, string[]> = {
+  // FIX (real bug, confirmed by hand, round 3): the bare 'ios' hint matched
+  // ANY cpe string containing that substring — including "ios_xr_software"
+  // and "ios_xe_software". That's exactly how CVE-2023-20190 slipped
+  // through: it's an IOS-XR-only "incorrect authorization" vulnerability
+  // (CVSS 5.3), but its CPE string "cpe:...:cisco:ios_xr_software:..."
+  // contains the substring "ios", so it matched cisco_ios's hint list and
+  // was kept instead of dropped. Anchored to ':ios:' (colon-delimited)
+  // instead, which only matches the exact classic-IOS product field, not
+  // "ios_xr_software" or "ios_xe_software" as substrings of something else.
+  cisco_ios: ['ios_xe', ':ios:', 'catalyst'],
+  cisco_nxos: ['nx-os', 'nxos', 'nexus'],
+  cisco_xr: ['ios_xr', 'ios-xr'],
+  juniper: ['junos'],
+  arista: ['eos', 'arista'],
+  fortinet: ['fortios', 'fortigate'],
+  paloalto: ['pan-os', 'panos', 'paloaltonetworks'],
+  huawei: ['vrp', 'huawei'],
+  aruba_hpe: ['arubaos', 'procurve', 'aruba'],
+  dell_os10: ['os10', 'dell'],
+  f5_tmsh: ['big-ip', 'bigip', 'tmos', 'f5'],
+  nokia_sros: ['sr_os', 'timos', 'nokia'],
+  vyos: ['vyos'],
+  extreme_exos: ['exos', 'extreme'],
+  mikrotik: ['routeros', 'mikrotik'],
+  // No reliable platform keyword to check against for an unidentified
+  // vendor — nothing to confirm OR deny, so this vendor is exempted from
+  // the CPE check entirely (existence-only verification still applies).
+  generic: [],
+};
+
+async function verifyCvesAgainstNvd(candidates: string[], vendorType: VendorType): Promise<string[]> {
   const CVE_RE = /^CVE-\d{4}-\d{4,7}$/i;
   const syntacticallyValid = Array.from(
     new Set(
@@ -114,6 +150,7 @@ async function verifyCvesAgainstNvd(candidates: string[]): Promise<string[]> {
   // with that response and isn't worth burning the rate limit on.
   const toCheck = syntacticallyValid.slice(0, 8);
   const verified: string[] = [];
+  const platformHints = VENDOR_CPE_HINTS[vendorType] || [];
 
   for (const cveId of toCheck) {
     try {
@@ -135,11 +172,41 @@ async function verifyCvesAgainstNvd(candidates: string[]): Promise<string[]> {
         continue;
       }
       const data = await res.json();
-      if (Array.isArray(data?.vulnerabilities) && data.vulnerabilities.length > 0) {
-        verified.push(cveId);
-      } else {
+      const record = Array.isArray(data?.vulnerabilities) ? data.vulnerabilities[0] : null;
+      if (!record) {
         console.warn(`[!] Dropping unverifiable CVE from AI output (no NVD record): ${cveId}`);
+        continue;
       }
+
+      // Platform relevance check (see doc comment above). Walk every
+      // cpeMatch criteria string in every config node and require at least
+      // one to mention this vendor's platform family.
+      if (platformHints.length > 0) {
+        const configurations = record?.cve?.configurations;
+        const cpeStrings: string[] = [];
+        if (Array.isArray(configurations)) {
+          for (const config of configurations) {
+            for (const node of config?.nodes || []) {
+              for (const match of node?.cpeMatch || []) {
+                if (typeof match?.criteria === 'string') cpeStrings.push(match.criteria.toLowerCase());
+              }
+            }
+          }
+        }
+
+        if (cpeStrings.length > 0) {
+          const matchesPlatform = cpeStrings.some((cpe) => platformHints.some((hint) => cpe.includes(hint)));
+          if (!matchesPlatform) {
+            console.warn(`[!] Dropping ${cveId} as a platform mismatch for ${vendorType} — CPE data: ${cpeStrings.slice(0, 3).join(', ')}`);
+            continue;
+          }
+        }
+        // No cpeMatch data at all on this record — can't confirm OR deny
+        // relevance, so fail open rather than punish a sparse/older CVE
+        // entry for missing metadata it never had.
+      }
+
+      verified.push(cveId);
     } catch (err) {
       // Network/timeout failure — fail open, see doc comment above.
       console.warn(`[!] NVD verification unreachable for ${cveId}, keeping candidate as unconfirmed:`, err);
@@ -401,7 +468,16 @@ async function analyzeFirmwareWithGroq(
                 // (see verifyCvesAgainstNvd below), but the model is also
                 // told directly not to guess, since prevention beats
                 // filtering.
-                'cves must only contain CVE identifiers you are genuinely confident are real, published vulnerabilities that apply to this exact vendor/platform and version range. Never invent a CVE ID, never approximate one, and never reuse an ID you loosely recall from a different product, a different vendor, or a non-CVE report (e.g. a Talos/PSIRT advisory number is NOT a CVE ID). If you are not certain a specific CVE applies, omit it entirely — returning an empty cves array is the correct, expected answer when you have no high-confidence match, not a failure to avoid.',
+                'cves must only contain CVE identifiers you are genuinely confident are real, published vulnerabilities that apply to this exact vendor/platform AND hardware family and version range. Never invent a CVE ID, never approximate one, and never reuse an ID you loosely recall from a different product, a different vendor, or a non-CVE report (e.g. a Talos/PSIRT advisory number is NOT a CVE ID). ' +
+                // FIX (round 2, real bug, confirmed by hand): the model also
+                // returns CVE IDs that ARE real and ARE for Cisco, but for
+                // the WRONG Cisco product line — e.g. attaching an ASR 1000
+                // router CVE or a Small Business switch web-UI CVE to a
+                // Catalyst 9300 running IOS-XE. Being a real Cisco CVE
+                // number is not the same as applying to this exact
+                // hardware family; the model must actively rule that out,
+                // not just recall a plausible-looking ID.
+                'Before including any CVE, explicitly confirm it is scoped to the SAME hardware family and software platform as the device under analysis (e.g. Catalyst switch + IOS-XE is a different affected-product scope than ASR/ISR routers, and different again from the Small Business 200/300/500 switch line, even though all three are "Cisco"). If you are not certain a specific CVE applies to BOTH this vendor/platform AND this exact hardware family, omit it entirely — returning an empty cves array is the correct, expected answer when you have no high-confidence match, not a failure to avoid.',
             },
             {
               role: 'user',
@@ -423,9 +499,11 @@ async function analyzeFirmwareWithGroq(
         const content = JSON.parse(rawContent);
         const parsedLLMRisk = normalizeRiskLevel(content.riskLevel);
         const rawCves = Array.isArray(content.cves) ? content.cves : [];
-        // FIX: verify every candidate CVE against NVD before trusting it —
-        // see verifyCvesAgainstNvd doc comment above for why.
-        const cves = await verifyCvesAgainstNvd(rawCves);
+        // FIX: verify every candidate CVE against NVD — both that it exists
+        // AND that its recorded CPE data actually names this platform
+        // family — before trusting it. See verifyCvesAgainstNvd doc
+        // comment above for why both checks are needed.
+        const cves = await verifyCvesAgainstNvd(rawCves, vendorType);
 
         const staticFloor = getDeterministicFirmwareRisk(rawVersion, cves);
         const finalRisk = getHighestRiskLevel(staticFloor, parsedLLMRisk);
@@ -447,6 +525,16 @@ async function analyzeFirmwareWithGroq(
               ? content.eolStatus.trim()
               : fallback.eolStatus,
         };
+      } else {
+        // FIX: a non-OK response (401 bad/missing key, 429 rate-limited,
+        // 400 bad request, 5xx Groq-side error) was previously swallowed
+        // completely silently — no console output at all, nothing to tell
+        // you WHY it fell back to the generic vendor placeholder. This was
+        // indistinguishable from "working as intended" in the logs.
+        const errBody = await response.text().catch(() => '<unreadable body>');
+        console.warn(
+          `[!] Groq Firmware AI call returned non-OK status ${response.status} ${response.statusText}. Falling back to vendor defaults. Body: ${errBody.slice(0, 500)}`
+        );
       }
     } catch (err) {
       console.warn('[!] Groq Firmware AI call failed, falling back to vendor defaults:', err);

@@ -106,7 +106,18 @@ async function performLlmAnalysis(
               content: `Device Context:\n- Hostname: ${hostname}\n- OS Platform: ${vendor}\n\nStatic CIS Audit Findings (${findings.length} total):\n${JSON.stringify(compressedFindings, null, 2)}\n\n${wrapUntrustedContent('running_configuration', truncatedConfig)}`,
             },
           ],
-          temperature: 0.1,
+          // FIX: dropped from 0.1 to 0.0 to match analyze-firmware/route.ts's
+          // Groq call. This endpoint's output (riskLevel, CIS-adjacent
+          // findings narrative) is a classification/audit result, not
+          // creative writing — identical input (same config, same vendor,
+          // same static findings) should not flip between MEDIUM and HIGH
+          // across runs. This is vendor-agnostic: the prompt and findings
+          // payload are already built generically from whatever
+          // detectVendor() resolves, for any of the 16 supported platforms,
+          // so lowering temperature doesn't single out or change behavior
+          // for any one vendor — it just makes the model's own self-rated
+          // riskLevel more reproducible for all of them equally.
+          temperature: 0.0,
           response_format: { type: 'json_object' },
         }),
       }).finally(() => clearTimeout(timeoutId));
