@@ -825,6 +825,35 @@ async function analyzeFirmwareWithGroq(
   };
 }
 
+/**
+ * NEW: plain version comparison (vendor-agnostic, no AI). Pulls the first
+ * dotted number out of each text (e.g. "17.15.04c" -> [17,15,4]) and
+ * compares the first 2 parts (train level). Returns 'newer' | 'same' |
+ * 'older' | 'unknown'. Used so the report never tells someone to
+ * "upgrade" to a release that is OLDER than the one installed.
+ */
+function extractVersionParts(text: string): number[] | null {
+  const m =
+    text.match(/version[:\s]+v?(\d+(?:\.\d+){1,3})/i) ||
+    text.match(/(\d+(?:\.\d+){1,3})/);
+  if (!m) return null;
+  return m[1].split('.').map((n) => parseInt(n, 10));
+}
+
+function compareInstalledToTarget(
+  installedText: string,
+  targetText: string
+): 'newer' | 'same' | 'older' | 'unknown' {
+  const a = extractVersionParts(installedText);
+  const b = extractVersionParts(targetText);
+  if (!a || !b) return 'unknown';
+  for (let i = 0; i < Math.min(2, a.length, b.length); i++) {
+    if (a[i] > b[i]) return 'newer';
+    if (a[i] < b[i]) return 'older';
+  }
+  return 'same';
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -893,7 +922,18 @@ export async function POST(req: NextRequest) {
     const isVersionSpecificUpgradeLine = (rec: string): boolean =>
       /upgrade|update/i.test(rec) && VERSION_LIKE_RE.test(rec);
 
-    const groundedUpgradeLine = `Upgrade to the vendor's current recommended release, **${analysis.targetFirmware}**, as soon as possible.`;
+    // FIX: this line always said "Upgrade to ...", even when the installed
+    // release was NEWER than the AI's recommended train (seen on a device
+    // running 17.15.4c with a recommended "17.12.04a LTS"; the AI's own
+    // summary said "newer than the recommended LTS" while this line said
+    // "upgrade as soon as possible"). Now it compares the two first.
+    const versionCompare = compareInstalledToTarget(rawVersion, analysis.targetFirmware);
+    const groundedUpgradeLine =
+      versionCompare === 'newer'
+        ? `The installed release is **newer** than the recommended train (**${analysis.targetFirmware}**), so no upgrade is needed. Check the vendor's lifecycle page to confirm the installed train is still supported.`
+        : versionCompare === 'same'
+        ? `The installed release is on the recommended train (**${analysis.targetFirmware}**). Apply the latest maintenance patch for that train.`
+        : `Upgrade to the vendor's current recommended release, **${analysis.targetFirmware}**, as soon as possible.`;
     const groundedRecommendations = analysis.usedFallback
       ? analysis.recommendations
       : [
