@@ -89,6 +89,13 @@ export function VersionTab({
     if (isUnresolvedPlaceholder(target)) target = undefined;
     if (isUnresolvedPlaceholder(eol)) eol = undefined;
 
+    // No AI analysis has run yet (fresh device, only telemetry collected).
+    // Don't show the built-in vendor defaults below as if they were results:
+    // they are a generic guess, not an assessment of THIS device.
+    if (!osSummaryToRender && !target && !eol) {
+      return { targetFirmware: 'Pending AI assessment', eolStatus: 'Pending AI assessment' };
+    }
+
     if (osSummaryToRender) {
       // FIX: both checks below used to scan the whole free-form AI narrative
       // with loose keyword regexes. That's what produced a real bug: the
