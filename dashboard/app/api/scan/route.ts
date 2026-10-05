@@ -30,6 +30,27 @@ function getHighestRiskLevel(riskA: RiskLevel, riskB: RiskLevel): RiskLevel {
   return rankA >= rankB ? riskA : riskB;
 }
 
+/**
+ * FIX (safety net, not the primary fix — see the system-prompt instruction
+ * above): in case the model still writes a fabricated line-number citation
+ * despite being told not to, this strips any "(line NN...)" / "(lines
+ * NN-MM...)" fragment out of an AI-written recommendation before it reaches
+ * the UI, and logs it so that's visible instead of silently rewriting what
+ * the model said with no trace.
+ */
+function stripFabricatedLineCitations(recommendations: string[]): string[] {
+  const LINE_CITATION_RE = /\s*\(?\s*lines?\s+\d+\s*(?:[-–‑]\s*\d+)?[^)]*\)?/gi;
+  return recommendations.map((rec) => {
+    const cleaned = rec.replace(LINE_CITATION_RE, '').replace(/\s{2,}/g, ' ').trim();
+    if (cleaned !== rec.trim()) {
+      console.warn(
+        `[!] Stripped a fabricated line-number citation from an AI recommendation (model ignored the no-line-numbers instruction): "${rec}"`
+      );
+    }
+    return cleaned || rec; // never emit a blank recommendation
+  });
+}
+
 function normalizeRiskLevel(val?: string): RiskLevel {
   const normalized = String(val || '').toUpperCase();
   if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(normalized)) {
@@ -55,6 +76,19 @@ function normalizeRiskLevel(val?: string): RiskLevel {
  * clamp actually fires, it's logged and surfaced in the API response
  * (aiAnalysis.riskWasClamped) rather than silently corrected, so it's
  * visible during testing and explainable in a viva.
+ *
+ * FIX (confirmed by hand, repeatedly, on a config with 0 CIS violations):
+ * the +1-level margin above the floor was being applied even when the
+ * floor itself is LOW — meaning a fully compliant config (0 violations)
+ * could still be bumped to MEDIUM on nothing but the AI's own opinion
+ * (observed: it decided a /24 management ACL was "too broad", with no
+ * rule or evidence backing that). That one-step benefit of the doubt
+ * makes sense when there's already some real evidence to argue from (a
+ * MEDIUM or HIGH floor, where the AI may have spotted something extra the
+ * static ruleset doesn't cover) — but when the floor is LOW, there is by
+ * definition no violation to extrapolate from, so the margin only ever
+ * lets the AI invent risk out of nothing. A LOW floor now allows no
+ * margin at all; MEDIUM/HIGH/CRITICAL floors keep the existing +1 step.
  */
 function clampAiRiskToFloor(
   aiRisk: RiskLevel,
@@ -62,7 +96,8 @@ function clampAiRiskToFloor(
 ): { clamped: RiskLevel; wasClamped: boolean } {
   const floorRank = RISK_RANKS[floorRisk] ?? 1;
   const aiRank = RISK_RANKS[aiRisk] ?? 1;
-  const ceilingRank = Math.min(4, floorRank + 1);
+  const margin = floorRisk === 'LOW' ? 0 : 1;
+  const ceilingRank = Math.min(4, floorRank + margin);
 
   if (aiRank <= ceilingRank) {
     return { clamped: aiRisk, wasClamped: false };
@@ -131,7 +166,15 @@ async function performLlmAnalysis(
                 // port, not a finding. The model pattern-matched on "unused
                 // VLANs on trunks are bad" instead of reading the literal
                 // config it was given.
-                'Every claim and recommendation must be grounded strictly in the literal text of the running-configuration provided below — never state that a VLAN, interface, ACL, or feature appears somewhere in the config unless you can point to the exact line. Before recommending that a VLAN be removed from a trunk\'s allowed-vlan list, re-read that trunk interface\'s own "switchport trunk allowed vlan" line and confirm the VLAN number is actually present in it. If a port is administratively shut down and assigned to an otherwise-unused VLAN, that is a standard hardening pattern (a "blackhole" VLAN) — do not flag it as a gap.',
+                'Every claim and recommendation must be grounded strictly in the literal text of the running-configuration provided below — never state that a VLAN, interface, ACL, or feature appears somewhere in the config unless you can quote the exact command or interface name it appears under. Before recommending that a VLAN be removed from a trunk\'s allowed-vlan list, re-read that trunk interface\'s own "switchport trunk allowed vlan" line and confirm the VLAN number is actually present in it. If a port is administratively shut down and assigned to an otherwise-unused VLAN, that is a standard hardening pattern (a "blackhole" VLAN) — do not flag it as a gap. ' +
+                // FIX (real bug, confirmed by hand, round 2): recommendations
+                // were citing specific line numbers (e.g. "line 71-73") that
+                // did not correspond to the content being described — the
+                // model was never given a numbered version of the config, so
+                // any line number it writes is fabricated, not looked up.
+                // Quoting the exact command/interface name is checkable
+                // against the literal config text; a line number is not.
+                'You are NOT given line numbers for the configuration below, so NEVER cite or invent one (e.g. "line 71-73", "lines 31-38") in a recommendation — any such number would be fabricated, not a real lookup, and is actively misleading to the reader. When you need to point someone to a specific part of the configuration, quote the exact interface name or command text instead (e.g. "see interface Vlan99" or "the switchport trunk allowed vlan line on Port-channel1"), never a line number.',
             },
             {
               role: 'user',
@@ -154,6 +197,16 @@ async function performLlmAnalysis(
           // for any one vendor — it just makes the model's own self-rated
           // riskLevel more reproducible for all of them equally.
           temperature: 0.0,
+          // FIX: same mitigation as analyze-firmware/route.ts, applied
+          // preventively here too — openai/gpt-oss-120b can exhaust its
+          // token budget on internal reasoning before writing the actual
+          // JSON answer when no max_tokens is set, which fails Groq's
+          // json_object validation with an empty generation (confirmed
+          // happening on the firmware-analysis endpoint from your
+          // terminal log; this endpoint has a shorter prompt so it's less
+          // likely to hit it, but the same risk exists).
+          reasoning_effort: 'low',
+          max_tokens: 2048,
           response_format: { type: 'json_object' },
         }),
       }).finally(() => clearTimeout(timeoutId));
@@ -165,9 +218,10 @@ async function performLlmAnalysis(
 
         try {
           const content = JSON.parse(rawContent);
+          const rawRecommendations = Array.isArray(content.recommendations) ? content.recommendations : [];
           return {
             summary: content.summary || 'AI Security Audit completed.',
-            recommendations: Array.isArray(content.recommendations) ? content.recommendations : [],
+            recommendations: stripFabricatedLineCitations(rawRecommendations),
             llmRiskLevel: normalizeRiskLevel(content.riskLevel),
           };
         } catch (parseErr) {
@@ -267,6 +321,30 @@ export async function POST(req: NextRequest) {
           .maybeSingle();
         if (idOnlyConfig) {
           configurationId = idOnlyConfig.id;
+        } else {
+          // FIX: a device whose config text was seeded directly onto
+          // devices.last_config (e.g. a demo/lab device that never went
+          // through the real SSH "Collect Telemetry" pipeline) has NO
+          // configurations row at all, for any scan, ever — so the lookup
+          // above always comes back empty and every scan for that device
+          // permanently dead-ends at "not persisted" below, regardless of
+          // how many times it's re-run. We already have real, valid config
+          // text in hand right now (`rawConfig`, validated above), so
+          // create the missing snapshot ourselves instead of only ever
+          // reading for one. This is vendor-agnostic — it runs the same way
+          // for any device on any platform, not just Cisco.
+          const { data: createdConfig } = await supabase
+            .from('configurations')
+            .insert({
+              device_id: deviceId,
+              raw_config: rawConfig,
+              created_at: new Date().toISOString(),
+            })
+            .select('id')
+            .maybeSingle();
+          if (createdConfig) {
+            configurationId = createdConfig.id;
+          }
         }
       }
     }
@@ -350,7 +428,34 @@ ${f.remediationCli}
 ---
 
 ### 💡 Hardening Action Items
-${aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')}`;
+${
+  // FIX: this section used to render aiAnalysis.recommendations — the
+  // LLM's own free-text paraphrase of what to do about each finding. That's
+  // exactly where a real mismatch was found: for a CIS-1.4 (disable HTTP)
+  // finding, the CIS Benchmark Violations section above correctly shows
+  // `set deviceconfig system service disable-http yes`, but the LLM's own
+  // restated version of the same fix here said `set network interface
+  // management https-enable yes` — a command that enables HTTPS, not one
+  // that disables HTTP. The AI wasn't lying about the config; it just
+  // mis-recalled the exact syntax when re-explaining a fix in its own
+  // words instead of quoting the already-verified command.
+  //
+  // Each `validatedFinding` already carries its own exact, correct
+  // `remediationCli` (built deterministically per-vendor by
+  // evaluateConfigDeterministically(), not by the LLM) — the same string
+  // shown in the section above. Reusing it here instead of the LLM's prose
+  // makes this class of mismatch structurally impossible: both sections
+  // now read from the identical source, for any of the 19 platforms in
+  // collector.py's VENDOR_COMMAND_MAP, not just Cisco.
+  //
+  // A config with zero deterministic findings has nothing to quote, so
+  // that case alone still falls back to the AI's own general recommendations.
+  validatedFindings.length > 0
+    ? validatedFindings
+        .map((f: ValidatedFinding, idx: number) => `**${idx + 1}.** ${f.title} — \`${f.remediationCli}\``)
+        .join('\n')
+    : aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')
+}`;
 
     // FIX (schema-confirmed bug): public.scans has no `findings` column at
     // all — that key was silently rejected by every insert/update below

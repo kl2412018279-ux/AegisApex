@@ -28,6 +28,12 @@ interface FirmwareAnalysis {
   // show ground-truth impact text rather than only the AI's own narrative.
   cves: VerifiedCve[];
   recommendations: string[];
+  // NEW: surfaced for transparency, same pattern as scan/route.ts's
+  // riskWasClamped — lets the UI (and a viva) show exactly what the AI
+  // self-rated vs. what was actually displayed.
+  rawAiRiskLevel: RiskLevel;
+  staticFloorRisk: RiskLevel;
+  riskWasClamped: boolean;
   // NEW: previously these two values were never produced by the AI at all —
   // they were hardcoded three layers downstream (useDashboard.ts's
   // fetchScanResults/handleAnalyzeFirmware, then VersionTab.tsx's
@@ -56,6 +62,49 @@ function normalizeRiskLevel(val?: string): RiskLevel {
     return normalized as RiskLevel;
   }
   return 'MEDIUM';
+}
+
+/**
+ * FIX (consistency gap, confirmed by hand): scan/route.ts's Config tab
+ * clamps the AI's self-rated risk to at most one step above the
+ * deterministic floor (see clampAiRiskToFloor there) — this endpoint
+ * never had the same protection, so the Firmware tab's "Evaluated Threat
+ * Level" could be inflated by the AI's own self-rating with nothing to
+ * bound it. Observed in practice: two consecutive runs on the identical
+ * device returned HIGH here with a deterministic floor that would only
+ * justify MEDIUM (1 verified CVE, not EOL). Same clamp logic as the
+ * Config tab, applied here too, so both tabs give the AI the same amount
+ * of unchecked room to inflate a rating.
+ *
+ * FIX (confirmed by hand): a device with 0 verified CVEs and a non-EOL
+ * version (floor = LOW) still came back MEDIUM, with the AI's own
+ * narrative naming two specific CVE IDs that the verification step right
+ * below it had already checked and found 0 matches for — i.e. hallucinated
+ * CVE citations, not a disagreement about severity. The +1-level margin
+ * above the floor is reasonable when the floor is MEDIUM/HIGH/CRITICAL
+ * (there's already real evidence for the AI to reasonably extrapolate
+ * from), but a LOW floor means no CVEs and no EOL finding at all — there
+ * is nothing to extrapolate from, so the margin there only ever lets the
+ * AI invent risk out of nothing. Same fix as scan/route.ts: LOW floor now
+ * allows no margin at all; MEDIUM/HIGH/CRITICAL floors keep the +1 step.
+ */
+function clampAiRiskToFloor(
+  aiRisk: RiskLevel,
+  floorRisk: RiskLevel
+): { clamped: RiskLevel; wasClamped: boolean } {
+  const floorRank = RISK_RANKS[floorRisk] ?? 1;
+  const aiRank = RISK_RANKS[aiRisk] ?? 1;
+  const margin = floorRisk === 'LOW' ? 0 : 1;
+  const ceilingRank = Math.min(4, floorRank + margin);
+
+  if (aiRank <= ceilingRank) {
+    return { clamped: aiRisk, wasClamped: false };
+  }
+
+  const rankToLevel = (rank: number): RiskLevel =>
+    (Object.keys(RISK_RANKS) as RiskLevel[]).find((k) => RISK_RANKS[k] === rank) || 'LOW';
+
+  return { clamped: rankToLevel(ceilingRank), wasClamped: true };
 }
 
 // FIX (TS2345): this only ever reads cves.length, never an element's
@@ -138,6 +187,31 @@ const VENDOR_CPE_HINTS: Record<VendorType, string[]> = {
   // No reliable platform keyword to check against for an unidentified
   // vendor — nothing to confirm OR deny, so this vendor is exempted from
   // the CPE check entirely (existence-only verification still applies).
+  generic: [],
+};
+
+// Used only as a secondary, weaker signal when a CVE record has no
+// structured CPE data at all (see the "no CPE data" branch in
+// verifyCvesAgainstNvd) — a vendor's own common name, as it would
+// plausibly appear in that vendor's real CVE descriptions. Multi-vendor
+// by construction: every VendorType this system supports has an entry,
+// so no vendor gets a stricter or looser check than any other.
+const VENDOR_DISPLAY_NAMES: Record<VendorType, string[]> = {
+  cisco_ios: ['cisco'],
+  cisco_nxos: ['cisco'],
+  cisco_xr: ['cisco'],
+  juniper: ['juniper'],
+  arista: ['arista'],
+  fortinet: ['fortinet', 'fortigate'],
+  paloalto: ['palo alto', 'paloalto'],
+  huawei: ['huawei'],
+  aruba_hpe: ['aruba', 'hewlett packard', 'hpe'],
+  dell_os10: ['dell'],
+  f5_tmsh: ['f5', 'big-ip', 'bigip'],
+  nokia_sros: ['nokia'],
+  vyos: ['vyos'],
+  extreme_exos: ['extreme'],
+  mikrotik: ['mikrotik'],
   generic: [],
 };
 
@@ -279,10 +353,37 @@ async function verifyCvesAgainstNvd(
             console.warn(`[!] Dropping ${cveId} as a platform mismatch for ${vendorType} — CPE data: ${cpeStrings.slice(0, 3).join(', ')}`);
             continue;
           }
+        } else {
+          // FIX (real bug, confirmed by hand from your terminal log):
+          // this branch used to fail fully open on ANY record with no
+          // structured CPE data — "can't confirm or deny." In a real run,
+          // that let CVE-2024-37064 (a Python "ydata-profiling" library
+          // deserialization bug, completely unrelated to networking)
+          // through for a Cisco switch, because its NVD record had no
+          // cpeMatch data to check against. Nothing about that CVE is a
+          // hardware/platform nuance — it's a different product in a
+          // different ecosystem entirely, and the fix doesn't need
+          // structured CPE data to catch it: a genuine Cisco CVE's own
+          // free-text description almost always says "Cisco" (or names
+          // the specific platform) somewhere. If the description exists
+          // and names NEITHER this vendor NOR any of its platform
+          // keywords, that's strong enough evidence to drop it — only
+          // fail fully open when there's truly nothing to check (no
+          // description either).
+          const vendorNames = VENDOR_DISPLAY_NAMES[vendorType] || [];
+          if (nvdDescription && (platformHints.length > 0 || vendorNames.length > 0)) {
+            const descLower = nvdDescription.toLowerCase();
+            const mentionsThisVendor = [...platformHints, ...vendorNames].some((kw) => descLower.includes(kw));
+            if (!mentionsThisVendor) {
+              console.warn(
+                `[!] Dropping ${cveId} as a vendor/domain mismatch for ${vendorType} — no structured CPE data, and its description never mentions this vendor or platform. Excerpt: ${nvdDescription.slice(0, 150)}`
+              );
+              continue;
+            }
+          }
+          // No description text to check either — truly nothing to judge
+          // this on, so fail open as before.
         }
-        // No cpeMatch data at all on this record — can't confirm OR deny
-        // relevance, so fail open rather than punish a sparse/older CVE
-        // entry for missing metadata it never had.
       }
 
       // Fix B: hardware-family cross-check against the CVE's own
@@ -589,6 +690,23 @@ async function analyzeFirmwareWithGroq(
             },
           ],
           temperature: 0.0,
+          // FIX (real bug, confirmed by hand from your terminal log):
+          // Groq returned 400 json_validate_failed with an EMPTY
+          // failed_generation for this call. openai/gpt-oss-120b is a
+          // reasoning model — it spends output tokens on an internal
+          // reasoning pass before writing the actual JSON answer. With no
+          // max_tokens set, it has no guaranteed budget left for the
+          // answer itself after reasoning, especially on this endpoint's
+          // long system prompt (platform + hardware-family + CVE-accuracy
+          // rules combined) — it can exhaust the default token budget on
+          // reasoning alone and never emit the JSON, which is exactly
+          // "empty generation, fails JSON validation." Two mitigations:
+          // reasoning_effort caps how much the model spends on the hidden
+          // reasoning pass, and max_tokens guarantees headroom for the
+          // actual answer regardless. If this still 400s, the next
+          // terminal log will show it and we can tune further.
+          reasoning_effort: 'low',
+          max_tokens: 2048,
           response_format: { type: 'json_object' },
         }),
       });
@@ -610,10 +728,26 @@ async function analyzeFirmwareWithGroq(
         const cves = await verifyCvesAgainstNvd(rawCves, vendorType, rawVersion);
 
         const staticFloor = getDeterministicFirmwareRisk(rawVersion, cves);
-        const finalRisk = getHighestRiskLevel(staticFloor, parsedLLMRisk);
+        // FIX: clamp the AI's own self-rating to at most one step above the
+        // deterministic floor, same as scan/route.ts's Config tab — see
+        // clampAiRiskToFloor doc comment above for why (observed in
+        // practice: unclamped HIGH on a floor that only justified MEDIUM).
+        const { clamped: clampedAiRisk, wasClamped: riskWasClamped } = clampAiRiskToFloor(
+          parsedLLMRisk,
+          staticFloor
+        );
+        if (riskWasClamped) {
+          console.warn(
+            `[!] AI self-rated firmware risk (${parsedLLMRisk}) exceeded the deterministic floor (${staticFloor}) by more than one level for ${hostname}; clamped to ${clampedAiRisk}.`
+          );
+        }
+        const finalRisk = getHighestRiskLevel(staticFloor, clampedAiRisk);
 
         return {
           riskLevel: finalRisk,
+          rawAiRiskLevel: parsedLLMRisk,
+          staticFloorRisk: staticFloor,
+          riskWasClamped,
           summary: content.summary || 'OS/Firmware evaluation completed.',
           cves,
           recommendations: Array.isArray(content.recommendations) ? content.recommendations : [],
@@ -650,6 +784,12 @@ async function analyzeFirmwareWithGroq(
 
   return {
     riskLevel: fallbackRisk,
+    // This offline path never had an AI self-rating to clamp in the first
+    // place ('MEDIUM' above is a fixed placeholder, not a model opinion),
+    // so there's nothing to report as clamped.
+    rawAiRiskLevel: 'MEDIUM',
+    staticFloorRisk: fallbackFloor,
+    riskWasClamped: false,
     summary: fallback.summary,
     // Offline/static fallback entries are fixed, known-good CVE IDs we
     // wrote by hand (not AI output), but they still weren't looked up
@@ -710,12 +850,38 @@ export async function POST(req: NextRequest) {
 
     const riskBadge = analysis.riskLevel === 'CRITICAL' ? '🔴 CRITICAL' : analysis.riskLevel === 'HIGH' ? '🟠 HIGH' : analysis.riskLevel === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
 
+    // FIX: same grounding gap as scan/route.ts's "Hardening Action Items",
+    // applied here. `analysis.targetFirmware` and `analysis.recommendations`
+    // come back from the SAME single LLM JSON response, but as two
+    // separate fields the model wrote independently — nothing stops the
+    // model from naming one version in `targetFirmware` (the hero-card
+    // value) and a different, or just differently-worded, version inside
+    // its own free-text recommendations#1 ("Upgrade to ..."). That's not
+    // hypothetical: it's the exact failure mode the Version-tab hero-card
+    // bug turned out to be, one level up the stack from where that fix
+    // landed. Rather than trust the model to keep its own two answers in
+    // sync, drop whichever of its recommendations is itself a version-
+    // specific upgrade instruction, and replace it with one line built
+    // directly from the already-resolved `targetFirmware` value — so the
+    // hero card and this list can never disagree. Platform-agnostic: works
+    // the same for any of collector.py's 19 vendor types, since it only
+    // ever reads the already vendor-resolved `analysis.targetFirmware`.
+    const VERSION_LIKE_RE = /[0-9]+\.[0-9]+/;
+    const isVersionSpecificUpgradeLine = (rec: string): boolean =>
+      /upgrade|update/i.test(rec) && VERSION_LIKE_RE.test(rec);
+
+    const groundedUpgradeLine = `Upgrade to the vendor's current recommended release, **${analysis.targetFirmware}**, as soon as possible.`;
+    const groundedRecommendations = [
+      groundedUpgradeLine,
+      ...analysis.recommendations.filter((r) => !isVersionSpecificUpgradeLine(r)),
+    ];
+
     const formattedMarkdownSummary =
 `### 🔍 OS/Firmware Security Assessment
 
 * **Hostname:** ${hostnameStr}
 * **Vendor / Platform:** \`${vendorType}\`
-* **Evaluated Threat Level:** **${riskBadge}**
+* **Evaluated Threat Level:** **${riskBadge}**${analysis.riskWasClamped ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device as **${analysis.rawAiRiskLevel}**, which was more than one level above what the verified findings (CVE count, EOL status) justify. The displayed rating was capped to **${analysis.riskLevel}**, the highest level the evidence currently supports.` : ''}
 * **Recommended LTS Release:** ${analysis.targetFirmware}
 * **Lifecycle Support Status:** ${analysis.eolStatus}
 
@@ -742,7 +908,7 @@ ${
 ---
 
 ### 💡 Lifecycle & Hardening Recommendations
-${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')}`;
+${groundedRecommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')}`;
 
     // FIX (schema-confirmed bug): public.scans.configuration_id is NOT NULL.
     // The insert branch below used to write a scan with no configuration_id
@@ -798,7 +964,38 @@ ${analysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}
             .order('created_at', { ascending: false })
             .limit(1);
 
-          const configurationId = latestConfig?.[0]?.id ?? null;
+          let configurationId = latestConfig?.[0]?.id ?? null;
+
+          // FIX: same gap as scan/route.ts — a device whose config lives
+          // only on devices.last_config (never run through a real "Collect
+          // Telemetry" pass) has no configurations row, so a firmware-only
+          // run (e.g. clicking "Run AI Assessment" before any config scan
+          // has ever completed for this device) could never persist
+          // anything, forever. Pull whatever config text the device record
+          // actually has and create a minimal snapshot from it so firmware
+          // history isn't silently lost. Vendor-agnostic — reads whichever
+          // of these columns the row actually has, same as scan/route.ts.
+          if (!configurationId) {
+            const { data: devRow } = await supabase
+              .from('devices')
+              .select('last_config, raw_config, config')
+              .eq('id', deviceId)
+              .maybeSingle();
+            const fallbackConfigText =
+              devRow?.last_config || devRow?.raw_config || devRow?.config || null;
+            if (fallbackConfigText) {
+              const { data: createdConfig } = await supabase
+                .from('configurations')
+                .insert({
+                  device_id: deviceId,
+                  raw_config: fallbackConfigText,
+                  created_at: nowIso,
+                })
+                .select('id')
+                .maybeSingle();
+              configurationId = createdConfig?.id ?? null;
+            }
+          }
 
           if (configurationId) {
             await supabase

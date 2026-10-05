@@ -100,14 +100,43 @@ export function InventoryTab({
     { critical: 0, high: 0, medium: 0, low: 0, unassessed: 0 }
   );
 
-  const displayedDevices = filteredDevices.filter((dev) => {
-    if (!searchTerm.trim()) return true;
-    const term = searchTerm.toLowerCase();
-    const host = (dev.hostname || '').toLowerCase();
-    const ip = (dev.ip_address || (dev as any).management_ip || '').toLowerCase();
-    const vendor = (dev.vendor || '').toLowerCase();
-    return host.includes(term) || ip.includes(term) || vendor.includes(term);
-  });
+  // FIX: this list previously rendered `filteredDevices` in whatever order
+  // it arrived in, with no sort of its own. That order can shift between
+  // re-renders (risk values update at different times per-device during a
+  // bulk scan, the parent's own fetch can return rows in a different
+  // sequence, etc.), which is what showed up as devices visibly "jumping"
+  // positions after clicking "Scan Inventory". Sorting here, by a key that
+  // doesn't change moment-to-moment (severity, then hostname as a tiebreak),
+  // fixes both asks: Critical-to-Low ordering, and a position that only
+  // moves when a device's own severity genuinely changes.
+  const RISK_SORT_RANK: Record<string, number> = {
+    CRITICAL: 0,
+    HIGH: 1,
+    MEDIUM: 2,
+    LOW: 3,
+    CLEAN: 3,
+  };
+
+  const displayedDevices = filteredDevices
+    .filter((dev) => {
+      if (!searchTerm.trim()) return true;
+      const term = searchTerm.toLowerCase();
+      const host = (dev.hostname || '').toLowerCase();
+      const ip = (dev.ip_address || (dev as any).management_ip || '').toLowerCase();
+      const vendor = (dev.vendor || '').toLowerCase();
+      return host.includes(term) || ip.includes(term) || vendor.includes(term);
+    })
+    .slice()
+    .sort((a, b) => {
+      const threatA = (getHighestRisk(a.risk_level, aiCache[a.id]?.riskLevel) || 'UNASSESSED').toUpperCase();
+      const threatB = (getHighestRisk(b.risk_level, aiCache[b.id]?.riskLevel) || 'UNASSESSED').toUpperCase();
+      const rankA = RISK_SORT_RANK[threatA] ?? 4; // unassessed sinks to the bottom
+      const rankB = RISK_SORT_RANK[threatB] ?? 4;
+      if (rankA !== rankB) return rankA - rankB;
+      // Same severity tier: break the tie on hostname so these rows never
+      // swap order between renders for no visible reason.
+      return (a.hostname || '').localeCompare(b.hostname || '');
+    });
 
   const metricCardClass = (active: boolean) =>
     `p-3.5 rounded-xl border transition-all duration-200 cursor-pointer flex flex-col justify-between select-none relative ${

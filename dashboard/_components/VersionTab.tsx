@@ -69,26 +69,63 @@ export function VersionTab({
   const cachedAnalysis = selectedDevice?.id ? aiCache[selectedDevice.id]?.firmware : null;
   const osSummaryToRender = cachedAnalysis || currentOsSummary;
 
+  // FIX: useDashboard.ts's fetchScanResults() defaults target_firmware/
+  // eol_status to the literal string "Not yet analyzed" whenever a scan
+  // row doesn't have them persisted yet (e.g. a brand-new device's very
+  // first scan). That string is non-empty, so the plain `!target` / `!eol`
+  // checks below treated it as "already have a real answer" and skipped
+  // straight past the bullet-extraction fix — displaying "Not yet
+  // analyzed" in the hero cards even while the AI analysis panel right
+  // next to it showed the real, already-computed answer. Treat this
+  // sentinel (and plain emptiness) the same way: as "nothing resolved
+  // yet", so the extraction below actually runs.
+  const isUnresolvedPlaceholder = (v: string | null | undefined): boolean =>
+    !v || v.trim().toLowerCase() === 'not yet analyzed';
+
   // Dynamic metric extraction from AI output + device metadata
   const deriveFirmwareMetrics = () => {
     let target = latestScan?.target_firmware || (latestScan as any)?.recommended_version;
     let eol = latestScan?.eol_status || (latestScan as any)?.eolStatus;
+    if (isUnresolvedPlaceholder(target)) target = undefined;
+    if (isUnresolvedPlaceholder(eol)) eol = undefined;
 
     if (osSummaryToRender) {
-      // 1. Lifecycle support detection
+      // FIX: both checks below used to scan the whole free-form AI narrative
+      // with loose keyword regexes. That's what produced a real bug: the
+      // AI's own executive summary for an EOL Palo Alto device read
+      // "Immediate upgrade to a supported release is required" — the old
+      // EOL regex matched the bare word "supported" in that sentence and
+      // displayed "Active / Supported" for a device the same screen's AI
+      // analysis correctly labeled "End-of-Life (EOL)" one panel over. The
+      // AI's own response already includes unambiguous, explicitly-labeled
+      // bullet lines ("▸ Lifecycle Support Status: ...", "▸ Recommended LTS
+      // Release: ...") produced by the backend's formattedMarkdownSummary —
+      // we now parse those directly first, and only fall back to the old
+      // loose keyword guesses if a bullet line isn't present (e.g. an older
+      // cached analysis saved before this format existed).
+
+      // 1. Lifecycle support detection — prefer the AI's own labeled bullet.
       if (!eol) {
-        if (/not yet eol\/eos|mainstream|active support|supported/i.test(osSummaryToRender)) {
-          eol = 'Active / Supported';
-        } else if (/eol|eos|end of life|end of support|deprecated/i.test(osSummaryToRender)) {
+        const eolBulletMatch = osSummaryToRender.match(/Lifecycle Support Status:\s*([^\n▸]+)/i);
+        if (eolBulletMatch) {
+          eol = eolBulletMatch[1].trim();
+        } else if (/eol|eos|end[\s-]?of[\s-]?life|end[\s-]?of[\s-]?support|deprecated/i.test(osSummaryToRender)) {
           eol = 'End-of-Life (EOL)';
+        } else if (/not yet eol\/eos|mainstream|active support/i.test(osSummaryToRender)) {
+          eol = 'Active / Supported';
         }
       }
 
-      // 2. Target OS version regex matching
+      // 2. Target OS version — prefer the AI's own labeled bullet.
       if (!target || target.toLowerCase().includes('recommended') || target.toLowerCase().includes('latest')) {
-        const explicitMatch = osSummaryToRender.match(/(?:upgrade|target|recommended|latest)\s+(?:to\s+)?([A-Za-z0-9_.-]+\s+[0-9]+\.[0-9]+[A-Za-z0-9_.-]*)/i);
-        if (explicitMatch) {
-          target = explicitMatch[1];
+        const targetBulletMatch = osSummaryToRender.match(/Recommended LTS Release:\s*([^\n▸]+)/i);
+        if (targetBulletMatch) {
+          target = targetBulletMatch[1].trim();
+        } else {
+          const explicitMatch = osSummaryToRender.match(/(?:upgrade|target|recommended|latest)\s+(?:to\s+)?([A-Za-z0-9_.-]+\s+[0-9]+\.[0-9]+[A-Za-z0-9_.-]*)/i);
+          if (explicitMatch) {
+            target = explicitMatch[1];
+          }
         }
       }
     }
