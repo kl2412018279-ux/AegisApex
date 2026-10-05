@@ -178,15 +178,14 @@ export function useDashboard() {
         }
       }
 
+      // FIX: the Version tab's AI panel used to fall back to scans.summary
+      // when os_summary was empty. But scans.summary is the CONFIG audit
+      // text, so the Version tab showed the config findings ("7 Benchmark
+      // Rules Violated"). OS text now comes only from scans.os_summary.
       let osSummaryText = scanData.os_summary || '';
-      let versionInfoText = scanData.os_summary || scanData.summary || '';
+      let versionInfoText = osSummaryText;
 
-      if (!osSummaryText && scanData.summary && !scanData.summary.includes('Telemetry collected')) {
-        osSummaryText = scanData.summary;
-        versionInfoText = scanData.summary;
-      }
-
-      if (osSummaryText && !osSummaryText.includes('OS/Firmware Security Analysis') && !osSummaryText.includes('🔍')) {
+      if (osSummaryText && !osSummaryText.includes('OS/Firmware Security') && !osSummaryText.includes('🔍')) {
         if (osSummaryText.length < 100 && !osSummaryText.includes('\n')) {
           osSummaryText =
             `🔍 **OS/Firmware Security Analysis**\n\n` +
@@ -208,23 +207,9 @@ export function useDashboard() {
       // The raw text is still shown in the left "Collected Version
       // Telemetry" panel (it reads raw_version, not os_summary).
 
-      if (vulns && vulns.length > 0) {
-        let findingsSection = '\n\n**🔒 Security Findings:**\n\n';
-        vulns.slice(0, 5).forEach((v: any) => {
-          const severity = v.severity || v.risk_level || 'Medium';
-          const emoji = severity === 'Critical' ? '🔴' : severity === 'High' ? '🟠' : severity === 'Medium' ? '🟡' : '🟢';
-          const title = v.title || v.name || v.id || 'Security Issue';
-          const desc = v.description || v.summary || v.remediation || '';
-          findingsSection += `${emoji} **${title}**\n   ${desc}\n\n`;
-        });
-        if (vulns.length > 5) {
-          findingsSection += `*... and ${vulns.length - 5} more findings*`;
-        }
-
-        if (!osSummaryText.includes('Security Findings')) {
-          osSummaryText += findingsSection;
-        }
-      }
+      // FIX: removed the block that appended the CONFIG findings ("Security
+      // Findings ... 2 more findings") onto the OS text. They belong to the
+      // Config tab and are still returned in latestScan.vulnerabilities.
 
       let displaySummary = scanData.summary;
       if ((!displaySummary || displaySummary.includes('Telemetry collected')) && vulns.length > 0) {

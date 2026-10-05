@@ -976,7 +976,11 @@ ${groundedRecommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`
             .update({
               status: 'completed',
               risk_level: analysis.riskLevel,
-              summary: formattedMarkdownSummary,
+              // FIX: was `summary:`. scans.summary belongs to the Config tab
+              // (api/scan writes its audit there). Writing OS text into the same
+              // column let each run overwrite the other tab's text. OS text now
+              // has its own column, scans.os_summary (see add_os_summary.sql).
+              os_summary: formattedMarkdownSummary,
               target_firmware: analysis.targetFirmware,
               eol_status: analysis.eolStatus,
               updated_at: nowIso,
@@ -1032,7 +1036,8 @@ ${groundedRecommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`
                 configuration_id: configurationId,
                 status: 'completed',
                 risk_level: analysis.riskLevel,
-                summary: formattedMarkdownSummary,
+                summary: 'Telemetry collected; OS firmware analysis saved.',
+                os_summary: formattedMarkdownSummary,
                 target_firmware: analysis.targetFirmware,
                 eol_status: analysis.eolStatus,
                 created_at: nowIso,
