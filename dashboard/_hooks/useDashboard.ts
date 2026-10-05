@@ -198,14 +198,15 @@ export function useDashboard() {
         }
       }
 
-      if (!osSummaryText && scanData.raw_version) {
-        const rawPreview = scanData.raw_version.substring(0, 300);
-        osSummaryText =
-          `📡 **Raw Version Data Collected**\n\n` +
-          `\`\`\`\n${rawPreview}${scanData.raw_version.length > 300 ? '...' : ''}\n\`\`\`\n\n` +
-          `Click "Run AI Assessment" or "Re-analyze Firmware" to generate detailed security analysis.`;
-        versionInfoText = osSummaryText;
-      }
+      // FIX: this used to fill os_summary with a "Raw Version Data
+      // Collected ... Click Run AI Assessment" placeholder whenever the
+      // collector had saved raw_version but no AI analysis existed yet.
+      // That text is not an analysis, but the Version tab treated any
+      // non-empty os_summary as "AI has run": the AI panel showed the
+      // placeholder and the hero cards showed vendor defaults. Now
+      // os_summary stays empty until /api/analyze-firmware really runs.
+      // The raw text is still shown in the left "Collected Version
+      // Telemetry" panel (it reads raw_version, not os_summary).
 
       if (vulns && vulns.length > 0) {
         let findingsSection = '\n\n**🔒 Security Findings:**\n\n';

@@ -92,7 +92,12 @@ export function VersionTab({
     // No AI analysis has run yet (fresh device, only telemetry collected).
     // Don't show the built-in vendor defaults below as if they were results:
     // they are a generic guess, not an assessment of THIS device.
-    if (!osSummaryToRender && !target && !eol) {
+    // useDashboard.ts fills the panel with a "Raw Version Data Collected"
+    // placeholder when only telemetry exists, so that text must count as
+    // "no analysis yet" too (it is not an AI result).
+    const hasRealAnalysis =
+      !!osSummaryToRender && !/Raw Version Data Collected/i.test(osSummaryToRender);
+    if (!hasRealAnalysis && !target && !eol) {
       return { targetFirmware: 'Pending AI assessment', eolStatus: 'Pending AI assessment' };
     }
 
