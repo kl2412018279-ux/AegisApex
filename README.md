@@ -64,6 +64,10 @@ Set `CRON_SECRET` in Vercel as well; both callers send it as a bearer token. On 
 
 ### 3. Agent
 
+**Easiest:** on Windows, double-click `agent\start-agent.bat`; on macOS/Linux run `./agent/start-agent.sh`. The first run asks for your Supabase **Project URL** and **service_role key** (Supabase → Project Settings → API), saves them to `agent/.env`, installs what it needs into a private `.venv`, and starts the agent. After that it starts straight away. Keep the window open while the agent runs.
+
+Or set it up by hand / with Docker:
+
 Run the agent inside the network that can reach your devices:
 
 ```bash
