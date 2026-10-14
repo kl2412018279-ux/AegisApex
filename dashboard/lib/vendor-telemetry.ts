@@ -1,4 +1,6 @@
 // dashboard/lib/vendor-telemetry.ts
+// SYNTHETIC demo telemetry for devices flagged is_mock. Never used for real
+// devices: a fake snapshot that looks real is worse than no snapshot.
 /**
  * Generates vendor-specific Running Configurations
  */

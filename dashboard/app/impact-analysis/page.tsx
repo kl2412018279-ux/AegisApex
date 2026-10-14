@@ -55,8 +55,7 @@ export default function ImpactAnalysisPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          device_id: deviceId.trim(),
-          deviceId: deviceId.trim(),
+          ...(deviceId.trim() ? { deviceId: deviceId.trim() } : {}),
           proposed_cli: proposedCli,
           proposedCommand: proposedCli,
           activeConfig: '',
@@ -69,8 +68,24 @@ export default function ImpactAnalysisPage() {
         throw new Error(data.error || 'Failed to simulate configuration impact.');
       }
 
-      // Handle direct structured response vs wrapped endpoint response
-      if (data.risk_score !== undefined || data.service_impact_summary) {
+      // Current /api/analyze-impact response shape.
+      if (data.success && data.impactLevel) {
+        const level = String(data.impactLevel).toUpperCase();
+        const scores: Record<string, number> = { CRITICAL: 90, HIGH: 70, MEDIUM: 50, LOW: 20 };
+        setResult({
+          risk_score: scores[level] ?? 50,
+          risk_level: level,
+          blast_radius: `Disruption risk: ${data.disruptionRisk || 'UNKNOWN'}${data.aiUnavailable ? ' (keyword check only — AI unavailable)' : ''}`,
+          syntax_valid: true,
+          service_impact_summary: data.analysis || 'Analysis complete.',
+          dangerous_commands:
+            data.deterministicFloor === 'CRITICAL' || data.deterministicFloor === 'HIGH'
+              ? [{ command: proposedCli.split('\n')[0] || 'Proposed change', reason: 'Matches a command class that can reboot the device or cut management access.', severity: data.deterministicFloor }]
+              : [],
+          rollback_commands: Array.isArray(data.rollbackCommands) ? data.rollbackCommands : [],
+          raw_markdown: data.analysis,
+        });
+      } else if (data.risk_score !== undefined || data.service_impact_summary) {
         setResult({
           risk_score: data.risk_score ?? 50,
           risk_level: data.risk_level || 'MEDIUM',

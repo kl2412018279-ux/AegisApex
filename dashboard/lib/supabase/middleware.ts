@@ -1,4 +1,3 @@
-// C:\Users\hp\aiops-securewatch\dashboard\lib\supabase\middleware.ts
 // dashboard/lib/supabase/middleware.ts
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
@@ -47,8 +46,11 @@ export async function updateSession(request: NextRequest) {
   // delivery), that gap was invisible until now — with the matcher active,
   // an unauthenticated visitor to /forgot-password would have been
   // redirected straight to /login, making "Forgot password?" a dead link.
+  // Cron routes have no user session; they authenticate with CRON_SECRET
+  // inside the handler (lib/auth.ts requireCron).
+  const isCronRoute = pathname.startsWith('/api/cron/')
   const isPublicAuthPage =
-    isLoginPage || isAuthCallback || pathname.startsWith('/forgot-password') || pathname.startsWith('/reset-password')
+    isLoginPage || isAuthCallback || isCronRoute || pathname.startsWith('/forgot-password') || pathname.startsWith('/reset-password')
 
   // Unauthenticated request to anything else
   if (!user && !isPublicAuthPage) {

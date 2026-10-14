@@ -1,851 +1,72 @@
 // dashboard/app/api/analyze-firmware/route.ts
+// OS / firmware assessment.
+//   * CVEs: deterministic NVD lookup by CPE (platform + version), optional
+//     Cisco PSIRT advisories, and AI-suggested ids only after NVD confirms
+//     they apply. Each is enriched with CISA KEV and FIRST EPSS.
+//   * Risk floor: computed from those CVEs + EOL text (lib/vulnIntel.ts).
+//     The AI can raise it by at most one step, never above a LOW floor.
+//   * AI: lifecycle narrative and recommended release train only.
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase';
-// FIX: this route used to run its own ad-hoc vendor detection
-// (`vendor.toLowerCase().includes('cisco')` etc.) completely separately from
-// the real detectVendor() in cisBenchmarks.ts. Two parallel, independently
-// maintained vendor-classification implementations WILL drift apart — e.g.
-// cisBenchmarks.ts treats "comware"/"hp" as aruba_hpe, this file didn't know
-// that vendor existed at all. Now both files agree on vendor classification
-// by construction, because there's only one implementation.
-import { detectVendor, VendorType } from '@/lib/cisBenchmarks';
+import { detectVendor, type VendorType } from '@/lib/cisBenchmarks';
+import { requireUser, requireDevice } from '@/lib/auth';
+import { audit } from '@/lib/audit';
+import { enforceRateLimit } from '@/lib/rateLimit';
+import { FirmwareBody } from '@/lib/validation';
+import { readJson, routeError, HttpError } from '@/lib/http';
+import { groqJson } from '@/lib/groq';
+import { clampAiRiskToFloor, getHighestRiskLevel, normalizeRiskLevel, riskBadge, type RiskLevel } from '@/lib/risk';
+import { lookupVulnerabilities, firmwareRiskFloor, type CveRecord } from '@/lib/vulnIntel';
+import { recordRisk } from '@/lib/riskHistory';
+import { queueAlert } from '@/lib/alerts';
+import { wrapUntrustedContent } from '@/lib/security';
 
-export type RiskLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-
-interface DeviceRecord {
-  id?: string;
-  hostname?: string;
-  vendor?: string;
-  netmiko_type?: string;
-  raw_version?: string;
+interface AiFirmware {
+  riskLevel?: string;
+  summary?: string;
+  cves?: unknown;
+  recommendations?: unknown;
+  targetFirmware?: string;
+  eolStatus?: string;
 }
 
-interface FirmwareAnalysis {
-  riskLevel: RiskLevel;
-  summary: string;
-  // FIX (Fix C): now carries each verified CVE's real NVD description
-  // alongside its id, instead of just the bare id string, so the UI can
-  // show ground-truth impact text rather than only the AI's own narrative.
-  cves: VerifiedCve[];
-  recommendations: string[];
-  // NEW: surfaced for transparency, same pattern as scan/route.ts's
-  // riskWasClamped — lets the UI (and a viva) show exactly what the AI
-  // self-rated vs. what was actually displayed.
-  rawAiRiskLevel: RiskLevel;
-  staticFloorRisk: RiskLevel;
-  riskWasClamped: boolean;
-  // NEW: previously these two values were never produced by the AI at all —
-  // they were hardcoded three layers downstream (useDashboard.ts's
-  // fetchScanResults/handleAnalyzeFirmware, then VersionTab.tsx's
-  // deriveFirmwareMetrics vendor-guess table). The LLM now returns them
-  // directly, same as it already does for cves/recommendations.
-  targetFirmware: string;
-  eolStatus: string;
-  // true when Groq could not be reached/used and the offline table answered.
-  usedFallback?: boolean;
-}
+const SYSTEM_PROMPT = [
+  'You are an expert network OS and firmware vulnerability auditor. Analyze the provided "show version" output for OS version, EOL/EOS status, and CVEs SPECIFIC to the indicated vendor/OS platform.',
+  'Return ONLY valid JSON with keys: riskLevel (CRITICAL|HIGH|MEDIUM|LOW), summary (string), cves (string array), recommendations (string array), targetFirmware (string), eolStatus (string).',
+  'targetFirmware and eolStatus are REQUIRED. targetFirmware names the vendor\'s current recommended/LTS release train for the EXACT platform (e.g. "Cisco IOS-XE 17.9.x LTS", "FortiOS 7.4.x"). eolStatus is "Active / Supported" or "End-of-Life (EOL)" for the DETECTED version.',
+  'Only if the platform cannot be identified at all, return targetFirmware "Unable to determine (unidentified platform)" and eolStatus "Unknown — verify with vendor".',
+  // Every id is verified against NVD afterwards, but prevention beats filtering:
+  // the model has returned real Cisco CVEs for the wrong product line before.
+  'cves must only contain CVE identifiers you are confident are real and apply to this exact vendor, platform, hardware family and version. Never invent or approximate an id, and never use a vendor advisory number as a CVE id. An empty array is the correct answer when unsure.',
+].join(' ');
 
-const RISK_RANKS: Record<RiskLevel, number> = {
-  CRITICAL: 4,
-  HIGH: 3,
-  MEDIUM: 2,
-  LOW: 1,
+// Offline fallback recommendations, used only when the AI is unavailable.
+const FALLBACK_RECOMMENDATIONS: Record<VendorType, string[]> = {
+  cisco_ios: ['Enforce SSHv2 and restrict line vty access lists.', 'Disable the HTTP/HTTPS web UI if unused.'],
+  cisco_nxos: ['Disable feature telnet / feature http-server.', 'Restrict management access to the mgmt0 VRF with an ACL.'],
+  cisco_xr: ['Restrict management plane protection (MPP) to trusted interfaces.', 'Disable unused XML/NETCONF agents.'],
+  juniper: ['Disable Telnet and keep SSH-only system services.', 'Use sha-512 password format for local accounts.'],
+  arista: ['Disable the HTTP management API protocol, keep HTTPS only.', 'Use TACACS+/RADIUS rather than local-only accounts.'],
+  fortinet: ['Restrict SSL-VPN and admin GUI exposure to trusted source IPs.', 'Enable two-factor authentication for administrators.'],
+  paloalto: ['Disable Telnet/HTTP management (disable-telnet / disable-http).', 'Use a dedicated authentication profile for administrators.'],
+  huawei: ['Disable the Telnet server and enforce Stelnet/SSH.', 'Configure an AAA authentication scheme beyond local-only.'],
+  aruba_hpe: ['Disable cleartext REST API management on the default VRF.', 'Verify RADIUS failover for local accounts.'],
+  dell_os10: ['Enforce TLS 1.2+ on RESTCONF endpoints.', 'Restrict administrative access via a management VRF policy.'],
+  f5_tmsh: ['Restrict sshd to SSHv2.', 'Keep the management interface on an out-of-band network.'],
+  nokia_sros: ['Shut down Telnet and enforce SSH only.', 'Use hash2 password storage for local accounts.'],
+  vyos: ['Delete the Telnet service and keep SSH only.', 'Use RADIUS/TACACS+ rather than local-only accounts.'],
+  extreme_exos: ['Disable Telnet and the web UI.', 'Enable AAA rather than local-only accounts.'],
+  mikrotik: ['Disable the telnet and www services.', 'Use RADIUS-backed authentication for administrators.'],
+  generic: ['Check hardware lifecycle with the manufacturer.', 'Audit management interfaces for unencrypted protocols.'],
 };
 
-function getHighestRiskLevel(riskA: RiskLevel, riskB: RiskLevel): RiskLevel {
-  const rankA = RISK_RANKS[riskA] || 1;
-  const rankB = RISK_RANKS[riskB] || 1;
-  return rankA >= rankB ? riskA : riskB;
-}
-
-function normalizeRiskLevel(val?: string): RiskLevel {
-  const normalized = String(val || '').toUpperCase();
-  if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(normalized)) {
-    return normalized as RiskLevel;
-  }
-  return 'MEDIUM';
-}
-
-/**
- * FIX (consistency gap, confirmed by hand): scan/route.ts's Config tab
- * clamps the AI's self-rated risk to at most one step above the
- * deterministic floor (see clampAiRiskToFloor there) — this endpoint
- * never had the same protection, so the Firmware tab's "Evaluated Threat
- * Level" could be inflated by the AI's own self-rating with nothing to
- * bound it. Observed in practice: two consecutive runs on the identical
- * device returned HIGH here with a deterministic floor that would only
- * justify MEDIUM (1 verified CVE, not EOL). Same clamp logic as the
- * Config tab, applied here too, so both tabs give the AI the same amount
- * of unchecked room to inflate a rating.
- *
- * FIX (confirmed by hand): a device with 0 verified CVEs and a non-EOL
- * version (floor = LOW) still came back MEDIUM, with the AI's own
- * narrative naming two specific CVE IDs that the verification step right
- * below it had already checked and found 0 matches for — i.e. hallucinated
- * CVE citations, not a disagreement about severity. The +1-level margin
- * above the floor is reasonable when the floor is MEDIUM/HIGH/CRITICAL
- * (there's already real evidence for the AI to reasonably extrapolate
- * from), but a LOW floor means no CVEs and no EOL finding at all — there
- * is nothing to extrapolate from, so the margin there only ever lets the
- * AI invent risk out of nothing. Same fix as scan/route.ts: LOW floor now
- * allows no margin at all; MEDIUM/HIGH/CRITICAL floors keep the +1 step.
- */
-function clampAiRiskToFloor(
-  aiRisk: RiskLevel,
-  floorRisk: RiskLevel
-): { clamped: RiskLevel; wasClamped: boolean } {
-  const floorRank = RISK_RANKS[floorRisk] ?? 1;
-  const aiRank = RISK_RANKS[aiRisk] ?? 1;
-  const margin = floorRisk === 'LOW' ? 0 : 1;
-  const ceilingRank = Math.min(4, floorRank + margin);
-
-  if (aiRank <= ceilingRank) {
-    return { clamped: aiRisk, wasClamped: false };
-  }
-
-  const rankToLevel = (rank: number): RiskLevel =>
-    (Object.keys(RISK_RANKS) as RiskLevel[]).find((k) => RISK_RANKS[k] === rank) || 'LOW';
-
-  return { clamped: rankToLevel(ceilingRank), wasClamped: true };
-}
-
-// FIX (TS2345): this only ever reads cves.length, never an element's
-// shape, so it doesn't need to care whether it's called with the old
-// string[] (offline vendor fallback) or the new VerifiedCve[] (live Groq
-// path, see Fix C) — widened to `{ length: number }` so both call sites
-// type-check without needing two near-duplicate functions.
-function getDeterministicFirmwareRisk(rawVersion: string, cves: { length: number } = []): RiskLevel {
-  const versionLower = rawVersion.toLowerCase();
-
-  if (
-    versionLower.includes('end of life') ||
-    versionLower.includes('end-of-life') ||
-    versionLower.includes('eol') ||
-    versionLower.includes('obsolete') ||
-    versionLower.includes('unsupported')
-  ) {
-    return 'HIGH';
-  }
-
-  if (cves.length >= 3) {
-    return 'HIGH';
-  } else if (cves.length > 0) {
-    return 'MEDIUM';
-  }
-
-  return 'LOW';
-}
-
-// FIX (real bug, confirmed by hand, round 2): the previous verification pass
-// only checked "does this CVE ID exist in NVD at all" — it never checked
-// whether the CVE actually applies to the PRODUCT being audited. On a real
-// run against a Catalyst 9300 (IOS-XE 17.9.5), the model returned
-// CVE-2023-20187 (Cisco ASR 1000 routers, L2TP/mLRE DoS — a completely
-// different hardware family) and CVE-2023-20188 / CVE-2023-20189 (Cisco
-// Small Business 200/300/500 series switches' web UI — not Catalyst, not
-// IOS-XE at all). All three are real, NVD-confirmed CVE IDs, so the old
-// existence-only check passed every one of them through. The model is
-// recalling genuine Cisco CVE numbers and misattributing them to the wrong
-// product line — a subtler version of the same hallucination pattern.
-//
-// NVD's CVE 2.0 API response includes `configurations[].nodes[].cpeMatch[]`,
-// the actual list of CPE strings (vendor:product:version) the CVE is
-// recorded against. We now also require that at least one cpeMatch
-// criteria string in the response contains a platform keyword for the
-// vendor we detected locally (see VENDOR_CPE_HINTS) — if NONE of the CVE's
-// recorded CPEs mention this platform family at all, it's dropped as a
-// platform mismatch, independent of whether the ID itself is real.
-//
-// Still fails OPEN when the data needed to judge is simply missing or
-// unreachable (no configurations block on an older/sparse CVE record, or a
-// network/timeout error) — that's "can't confirm," not "confirmed wrong."
-// Only a confirmed NVD 404 (doesn't exist) or a confirmed CPE mismatch
-// (exists, but for a different product) causes a drop.
-const VENDOR_CPE_HINTS: Record<VendorType, string[]> = {
-  // FIX (real bug, confirmed by hand, round 3): the bare 'ios' hint matched
-  // ANY cpe string containing that substring — including "ios_xr_software"
-  // and "ios_xe_software". That's exactly how CVE-2023-20190 slipped
-  // through: it's an IOS-XR-only "incorrect authorization" vulnerability
-  // (CVSS 5.3), but its CPE string "cpe:...:cisco:ios_xr_software:..."
-  // contains the substring "ios", so it matched cisco_ios's hint list and
-  // was kept instead of dropped. Anchored to ':ios:' (colon-delimited)
-  // instead, which only matches the exact classic-IOS product field, not
-  // "ios_xr_software" or "ios_xe_software" as substrings of something else.
-  cisco_ios: ['ios_xe', ':ios:', 'catalyst'],
-  cisco_nxos: ['nx-os', 'nxos', 'nexus'],
-  cisco_xr: ['ios_xr', 'ios-xr'],
-  juniper: ['junos'],
-  arista: ['eos', 'arista'],
-  fortinet: ['fortios', 'fortigate'],
-  paloalto: ['pan-os', 'panos', 'paloaltonetworks'],
-  huawei: ['vrp', 'huawei'],
-  aruba_hpe: ['arubaos', 'procurve', 'aruba'],
-  dell_os10: ['os10', 'dell'],
-  f5_tmsh: ['big-ip', 'bigip', 'tmos', 'f5'],
-  nokia_sros: ['sr_os', 'timos', 'nokia'],
-  vyos: ['vyos'],
-  extreme_exos: ['exos', 'extreme'],
-  mikrotik: ['routeros', 'mikrotik'],
-  // No reliable platform keyword to check against for an unidentified
-  // vendor — nothing to confirm OR deny, so this vendor is exempted from
-  // the CPE check entirely (existence-only verification still applies).
-  generic: [],
-};
-
-// Used only as a secondary, weaker signal when a CVE record has no
-// structured CPE data at all (see the "no CPE data" branch in
-// verifyCvesAgainstNvd) — a vendor's own common name, as it would
-// plausibly appear in that vendor's real CVE descriptions. Multi-vendor
-// by construction: every VendorType this system supports has an entry,
-// so no vendor gets a stricter or looser check than any other.
-const VENDOR_DISPLAY_NAMES: Record<VendorType, string[]> = {
-  cisco_ios: ['cisco'],
-  cisco_nxos: ['cisco'],
-  cisco_xr: ['cisco'],
-  juniper: ['juniper'],
-  arista: ['arista'],
-  fortinet: ['fortinet', 'fortigate'],
-  paloalto: ['palo alto', 'paloalto'],
-  huawei: ['huawei'],
-  aruba_hpe: ['aruba', 'hewlett packard', 'hpe'],
-  dell_os10: ['dell'],
-  f5_tmsh: ['f5', 'big-ip', 'bigip'],
-  nokia_sros: ['nokia'],
-  vyos: ['vyos'],
-  extreme_exos: ['extreme'],
-  mikrotik: ['mikrotik'],
-  generic: [],
-};
-
-// FIX (Fix B, accepted as a heuristic mitigation, not a complete fix):
-// NVD's structured CPE data for a CVE often only encodes the SOFTWARE
-// family (e.g. cisco:ios_xe_software), not which HARDWARE line it
-// affects. A CVE that only affects ASR/ISR routers running IOS-XE can
-// still pass the CPE platform check above for a Catalyst switch also
-// running IOS-XE, because NVD's own structured data doesn't distinguish
-// hardware lines — that part is a genuine data gap, not something more
-// code alone can fully close.
-//
-// What IS fixable: NVD's free-text description for a CVE usually DOES
-// name the specific hardware line in prose (e.g. "Cisco ASR 1000 Series
-// Aggregation Services Routers"). So this cross-checks that description
-// text against the device's own detected hardware family (read from its
-// real "show version" output) and drops the CVE if the description
-// explicitly names a DIFFERENT family and never mentions the device's
-// own family. Built per-vendor, multi-vendor-safe: a vendor with no
-// entry here (or an unidentified device family) is exempted entirely —
-// same fail-open philosophy as VENDOR_CPE_HINTS above, and no vendor is
-// special-cased in the code path itself.
-const VENDOR_HARDWARE_FAMILIES: Partial<Record<VendorType, string[][]>> = {
-  cisco_ios: [
-    ['catalyst'],
-    ['asr'],
-    ['isr', 'integrated services router'],
-    ['small business', 'sf200', 'sg200', 'sf300', 'sg300', 'sf500', 'sg500', 'rv1', 'rv2', 'rv3'],
-    ['nexus'],
-  ],
-  // Other vendors aren't yet a confirmed instance of this exact failure
-  // mode in testing. Left unset (safe no-op) rather than guessed at —
-  // add an entry here only once a real same-OS-different-hardware case
-  // is observed for that vendor, the same way this one was.
-};
-
-/** Finds which hardware-family bucket a device's own version text matches, or -1 if none. */
-function detectHardwareFamily(rawVersionText: string, families: string[][]): number {
-  const lower = (rawVersionText || '').toLowerCase();
-  for (let i = 0; i < families.length; i++) {
-    if (families[i].some((kw) => lower.includes(kw))) return i;
-  }
-  return -1;
-}
-
-// FIX (Fix C): previously only the CVE *ID* survived verification — the
-// AI's own plain-English narrative of each CVE's impact (in its
-// `summary`) was never checked against anything, so a real,
-// platform-correct CVE ID could still carry an exaggerated description
-// (e.g. calling a command-authorization-bypass "remote code execution")
-// with nothing to catch it. NVD's own `descriptions[].value` text is
-// already being fetched during the existence check below — this now
-// keeps it and returns it alongside each verified CVE, so the UI can
-// show the real, verified NVD description directly instead of relying
-// solely on the AI's unverified narrative.
-export interface VerifiedCve {
-  id: string;
-  nvdDescription: string | null;
-}
-
-async function verifyCvesAgainstNvd(
-  candidates: string[],
-  vendorType: VendorType,
-  deviceRawVersion: string
-): Promise<VerifiedCve[]> {
-  const CVE_RE = /^CVE-\d{4}-\d{4,7}$/i;
-  const syntacticallyValid = Array.from(
-    new Set(
-      candidates
-        .map((c) => String(c || '').trim().toUpperCase())
-        .filter((c) => CVE_RE.test(c))
-    )
-  );
-
-  // Hard cap: this checks against a third-party API with no key (NVD's
-  // public rate limit is ~5 requests/30s), not a bulk import job. A single
-  // firmware analysis realistically surfaces a handful of CVEs — if the
-  // model ever returns more than this, something else is already wrong
-  // with that response and isn't worth burning the rate limit on.
-  const toCheck = syntacticallyValid.slice(0, 8);
-  const verified: VerifiedCve[] = [];
-  const platformHints = VENDOR_CPE_HINTS[vendorType] || [];
-
-  for (const cveId of toCheck) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(
-        `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${encodeURIComponent(cveId)}`,
-        { signal: controller.signal }
-      ).finally(() => clearTimeout(timeoutId));
-
-      if (res.status === 404) {
-        console.warn(`[!] Dropping unverifiable CVE from AI output (NVD 404): ${cveId}`);
-        continue;
-      }
-      if (!res.ok) {
-        // Rate-limited or NVD-side error — can't confirm either way, so
-        // don't penalize the candidate for an availability problem. No
-        // real description available either, since the fetch itself failed.
-        verified.push({ id: cveId, nvdDescription: null });
-        continue;
-      }
-      const data = await res.json();
-      const record = Array.isArray(data?.vulnerabilities) ? data.vulnerabilities[0] : null;
-      if (!record) {
-        console.warn(`[!] Dropping unverifiable CVE from AI output (no NVD record): ${cveId}`);
-        continue;
-      }
-
-      // Fix C: pull NVD's own real description once, reused below both
-      // for the hardware-family check and as the verified return value —
-      // this is what the UI should show instead of trusting the AI's own
-      // unverified narrative about this CVE's impact.
-      const nvdDescriptions = record?.cve?.descriptions;
-      const nvdDescription: string | null = Array.isArray(nvdDescriptions)
-        ? (nvdDescriptions.find((d: any) => d?.lang === 'en')?.value || null)
-        : null;
-
-      // Platform relevance check (see doc comment above). Walk every
-      // cpeMatch criteria string in every config node and require at least
-      // one to mention this vendor's platform family.
-      if (platformHints.length > 0) {
-        const configurations = record?.cve?.configurations;
-        const cpeStrings: string[] = [];
-        if (Array.isArray(configurations)) {
-          for (const config of configurations) {
-            for (const node of config?.nodes || []) {
-              for (const match of node?.cpeMatch || []) {
-                if (typeof match?.criteria === 'string') cpeStrings.push(match.criteria.toLowerCase());
-              }
-            }
-          }
-        }
-
-        if (cpeStrings.length > 0) {
-          const matchesPlatform = cpeStrings.some((cpe) => platformHints.some((hint) => cpe.includes(hint)));
-          if (!matchesPlatform) {
-            console.warn(`[!] Dropping ${cveId} as a platform mismatch for ${vendorType} — CPE data: ${cpeStrings.slice(0, 3).join(', ')}`);
-            continue;
-          }
-        } else {
-          // FIX (real bug, confirmed by hand from your terminal log):
-          // this branch used to fail fully open on ANY record with no
-          // structured CPE data — "can't confirm or deny." In a real run,
-          // that let CVE-2024-37064 (a Python "ydata-profiling" library
-          // deserialization bug, completely unrelated to networking)
-          // through for a Cisco switch, because its NVD record had no
-          // cpeMatch data to check against. Nothing about that CVE is a
-          // hardware/platform nuance — it's a different product in a
-          // different ecosystem entirely, and the fix doesn't need
-          // structured CPE data to catch it: a genuine Cisco CVE's own
-          // free-text description almost always says "Cisco" (or names
-          // the specific platform) somewhere. If the description exists
-          // and names NEITHER this vendor NOR any of its platform
-          // keywords, that's strong enough evidence to drop it — only
-          // fail fully open when there's truly nothing to check (no
-          // description either).
-          const vendorNames = VENDOR_DISPLAY_NAMES[vendorType] || [];
-          if (nvdDescription && (platformHints.length > 0 || vendorNames.length > 0)) {
-            const descLower = nvdDescription.toLowerCase();
-            const mentionsThisVendor = [...platformHints, ...vendorNames].some((kw) => descLower.includes(kw));
-            if (!mentionsThisVendor) {
-              console.warn(
-                `[!] Dropping ${cveId} as a vendor/domain mismatch for ${vendorType} — no structured CPE data, and its description never mentions this vendor or platform. Excerpt: ${nvdDescription.slice(0, 150)}`
-              );
-              continue;
-            }
-          }
-          // No description text to check either — truly nothing to judge
-          // this on, so fail open as before.
-        }
-      }
-
-      // Fix B: hardware-family cross-check against the CVE's own
-      // free-text description (see doc comment above verifyCvesAgainstNvd).
-      const hwFamilies = VENDOR_HARDWARE_FAMILIES[vendorType];
-      if (hwFamilies && hwFamilies.length > 0) {
-        const deviceFamilyIdx = detectHardwareFamily(deviceRawVersion, hwFamilies);
-        if (deviceFamilyIdx !== -1 && nvdDescription) {
-          const descLower = nvdDescription.toLowerCase();
-          const namesOwnFamily = hwFamilies[deviceFamilyIdx].some((kw) => descLower.includes(kw));
-          const namesOtherFamily = hwFamilies.some(
-            (fam, idx) => idx !== deviceFamilyIdx && fam.some((kw) => descLower.includes(kw))
-          );
-          if (namesOtherFamily && !namesOwnFamily) {
-            console.warn(
-              `[!] Dropping ${cveId} as a hardware-family mismatch for ${vendorType} — NVD description names a different hardware line than this device. Excerpt: ${nvdDescription.slice(0, 150)}`
-            );
-            continue;
-          }
-        }
-        // Either no usable description text, it's silent on hardware
-        // family either way, or the device's own family couldn't be
-        // identified from its version text — can't confirm OR deny, so
-        // fail open rather than guessing.
-      }
-
-      verified.push({ id: cveId, nvdDescription });
-    } catch (err) {
-      // Network/timeout failure — fail open, see doc comment above. No
-      // description available since the fetch itself never completed.
-      console.warn(`[!] NVD verification unreachable for ${cveId}, keeping candidate as unconfirmed:`, err);
-      verified.push({ id: cveId, nvdDescription: null });
-    }
-  }
-
-  return verified;
-}
-
-interface VendorFallbackEntry {
-  cves: string[];
-  recommendations: string[];
-  summary: string;
-  targetFirmware: string;
-  eolStatus: string;
-}
-
-// FIX: this used to only cover cisco/dell/aruba, with everything else —
-// including fortinet, despite fortinet having full CIS rule coverage in
-// cisBenchmarks.ts — silently landing on one generic bucket. The whole
-// system is built as multi-vendor (see VendorType in cisBenchmarks.ts);
-// this fallback table now matches that same vendor list 1:1. This is ONLY
-// the offline/last-resort safety net used when Groq is unreachable or
-// returns nothing usable — the LLM call above it is still the primary
-// source of truth per-device.
-const VENDOR_FALLBACK_MATRIX: Record<VendorType, (hostname: string) => VendorFallbackEntry> = {
-  cisco_ios: (h) => ({
-    cves: ['CVE-2023-20198', 'CVE-2023-20273'],
-    recommendations: [
-      'Enforce SSHv2 protocol and restrict line vty access lists.',
-      'Upgrade IOS-XE release to latest active maintenance train.',
-      'Disable HTTP/HTTPS integrated web server if unused.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Cisco IOS). OS version detected; verify active web UI configuration and management ACLs.`,
-    targetFirmware: 'Cisco IOS-XE 17.09.05 LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  cisco_nxos: (h) => ({
-    cves: ['CVE-2023-20123'],
-    recommendations: [
-      'Upgrade NX-OS to the latest recommended maintenance release for this platform.',
-      'Disable legacy Telnet/HTTP management features (feature telnet / feature http-server).',
-      'Restrict management-plane access via a dedicated mgmt0 VRF and ACL.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Cisco NX-OS). Verify current release against Cisco's NX-OS security advisories.`,
-    targetFirmware: 'Cisco NX-OS 10.3(x) LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  cisco_xr: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade IOS-XR to the latest recommended maintenance release for this platform.',
-      'Restrict management plane protection (MPP) to trusted interfaces only.',
-      'Disable unused XML/NETCONF agents if not actively used for automation.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Cisco IOS-XR). Verify current release against Cisco's IOS-XR security advisories.`,
-    targetFirmware: 'Cisco IOS-XR 7.9.x LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  juniper: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade Junos to the latest recommended EEOL (Extended End-of-Life) release train.',
-      'Disable Telnet services and enforce SSH-only system services.',
-      'Enable login password format sha-512 for all local accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Juniper Junos). Verify current release against Juniper's published EEOL schedule.`,
-    targetFirmware: 'Junos 21.4 EEOL',
-    eolStatus: 'Active / Supported',
-  }),
-  arista: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade EOS to the latest recommended release in Arista\'s current release train.',
-      'Disable the HTTP management API protocol, keep HTTPS only.',
-      'Enforce AAA authentication via TACACS+/RADIUS rather than local-only accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Arista EOS). Verify current release against Arista's security advisories.`,
-    targetFirmware: 'Arista EOS 4.31.x',
-    eolStatus: 'Active / Supported',
-  }),
-  fortinet: (h) => ({
-    cves: ['CVE-2022-40684'],
-    recommendations: [
-      'Upgrade FortiOS to the latest patched release in the current support train.',
-      'Restrict SSL-VPN and management-GUI exposure to trusted source IPs only.',
-      'Enable two-factor authentication for all administrative accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Fortinet FortiOS). Verify current build against Fortinet PSIRT advisories, particularly SSL-VPN CVEs.`,
-    targetFirmware: 'FortiOS 7.4.x LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  paloalto: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade PAN-OS to the latest preferred release per Palo Alto\'s release recommendation.',
-      'Disable Telnet/HTTP management services (disable-telnet / disable-http).',
-      'Enforce a dedicated authentication profile for all administrative accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Palo Alto PAN-OS). Verify current release against Palo Alto's PSIRT advisories.`,
-    targetFirmware: 'PAN-OS 11.1.x',
-    eolStatus: 'Active / Supported',
-  }),
-  huawei: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade VRP to the latest recommended patch version for this platform.',
-      'Disable the Telnet server (undo telnet server enable) and enforce SSH/Stelnet.',
-      'Configure a dedicated AAA authentication scheme rather than local-only auth.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Huawei VRP). Verify current version against Huawei's security advisories.`,
-    targetFirmware: 'Huawei VRP 8.x (current maintenance release)',
-    eolStatus: 'Active / Supported',
-  }),
-  aruba_hpe: (h) => ({
-    cves: ['CVE-2023-35984'],
-    recommendations: [
-      'Migrate to recommended ArubaOS-CX LTS release train.',
-      'Disable cleartext REST API management services on default VRF.',
-      'Verify AAA RADIUS server failover configuration for local user accounts.',
-    ],
-    summary: `Firmware audit complete for ${h} (ArubaOS-CX). System version identified; review vendor portal for platform release updates.`,
-    targetFirmware: 'ArubaOS-CX 10.13.1000 LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  dell_os10: (h) => ({
-    cves: ['CVE-2022-2917'],
-    recommendations: [
-      'Upgrade OS10 image to the latest recommended LTS maintenance release.',
-      'Ensure RESTCONF/eAPI management endpoints enforce strict TLS 1.2+ encryption.',
-      'Restrict control-plane administrative access via explicit management VRF policy.',
-    ],
-    summary: `Firmware analysis completed for target host ${h} running Dell OS10. System version identified; check Dell Security Advisories for baseline OS updates.`,
-    targetFirmware: 'Dell OS10 10.5.6.0',
-    eolStatus: 'Active / Supported',
-  }),
-  f5_tmsh: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade BIG-IP TMOS to the latest recommended point release for this version train.',
-      'Verify sys sshd Protocol is restricted to SSHv2 only.',
-      'Restrict the management interface to a dedicated out-of-band network.',
-    ],
-    summary: `Firmware analysis completed for ${h} (F5 BIG-IP / TMOS). Verify current version against F5's K-article security advisories.`,
-    targetFirmware: 'F5 BIG-IP TMOS 17.1.x',
-    eolStatus: 'Active / Supported',
-  }),
-  nokia_sros: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade SR OS to the latest recommended release for this chassis/platform.',
-      'Disable Telnet (configure system security telnet shutdown) and enforce SSH only.',
-      'Enable hash2 password storage for all local administrative accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Nokia SR OS). Verify current release against Nokia's security bulletins.`,
-    targetFirmware: 'Nokia SR OS 23.x',
-    eolStatus: 'Active / Supported',
-  }),
-  vyos: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade to the latest VyOS LTS rolling release.',
-      'Remove the Telnet service entirely (delete service telnet) and keep SSH only.',
-      'Configure RADIUS/TACACS+ authentication rather than local-only accounts.',
-    ],
-    summary: `Firmware analysis completed for ${h} (VyOS). Verify current version against the VyOS LTS release schedule.`,
-    targetFirmware: 'VyOS 1.4 LTS',
-    eolStatus: 'Active / Supported',
-  }),
-  extreme_exos: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade EXOS to the latest recommended release for this switch family.',
-      'Disable Telnet and the web UI in favor of SSH-only management (disable telnet / disable web).',
-      'Enable AAA (enable aaa) rather than relying on local accounts only.',
-    ],
-    summary: `Firmware analysis completed for ${h} (Extreme EXOS). Verify current version against Extreme Networks security advisories.`,
-    targetFirmware: 'Extreme EXOS 32.x',
-    eolStatus: 'Active / Supported',
-  }),
-  mikrotik: (h) => ({
-    cves: [],
-    recommendations: [
-      'Upgrade RouterOS to the latest stable channel release.',
-      'Disable the Telnet and www services (/ip service disable telnet,www), keep SSH/HTTPS only.',
-      'Enable RADIUS-backed authentication for administrative users.',
-    ],
-    summary: `Firmware analysis completed for ${h} (MikroTik RouterOS). Verify current version against MikroTik's changelog for security fixes.`,
-    targetFirmware: 'MikroTik RouterOS 7.x (stable channel)',
-    eolStatus: 'Active / Supported',
-  }),
-  generic: (h) => ({
-    cves: [],
-    recommendations: [
-      'Perform hardware life-cycle check with device manufacturer.',
-      'Upgrade system software to current secure baseline release.',
-      'Audit management interfaces for unencrypted transport protocols.',
-    ],
-    summary: `Firmware evaluation completed for host ${h}. Vendor platform could not be positively identified from the available telemetry — check manufacturer releases for active CVE hotfixes manually.`,
-    targetFirmware: 'Unable to determine (unidentified platform)',
-    eolStatus: 'Unknown — verify with vendor',
-  }),
-};
-
-/**
- * Returns platform-specific default security advisories when Groq API is
- * offline, unreachable, or returns nothing usable. This is now the ONLY
- * place static vendor version/lifecycle guesses live, used strictly as an
- * offline fallback across ALL vendors this system supports (see
- * VendorType in cisBenchmarks.ts) — not just a handful. It is never the
- * primary source of targetFirmware/eolStatus when Groq is reachable; the
- * LLM is asked for those directly in analyzeFirmwareWithGroq below.
- */
-function getVendorFallback(vendorType: VendorType, hostname: string): VendorFallbackEntry {
-  return VENDOR_FALLBACK_MATRIX[vendorType](hostname);
-}
-
-async function analyzeFirmwareWithGroq(
-  hostname: string,
-  vendorType: VendorType,
-  rawVersion: string
-): Promise<FirmwareAnalysis> {
-  const apiKey = process.env.GROQ_API_KEY;
-  const fallback = getVendorFallback(vendorType, hostname);
-
-  if (apiKey) {
-    try {
-      const callGroq = (model: string) => fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            {
-              role: 'system',
-              content:
-                // FIX: the model was previously allowed to silently omit
-                // targetFirmware/eolStatus (leaving them blank, which forced
-                // this route to fall back to generic placeholder text even
-                // on a fully successful call). It's now told explicitly
-                // that these two fields are REQUIRED on every response, and
-                // given exactly one sanctioned way to decline (only when the
-                // platform truly cannot be identified at all) rather than
-                // being able to leave them empty by default.
-                'You are an expert network OS and firmware vulnerability auditor. Analyze the provided "show version" telemetry for OS version, known EOL/EOS status, and CVE security vulnerabilities SPECIFIC to the indicated vendor/OS platform. Return ONLY valid JSON with keys: riskLevel (CRITICAL|HIGH|MEDIUM|LOW), summary (string), cves (string array), recommendations (string array), targetFirmware (string), and eolStatus (string). ' +
-                'targetFirmware and eolStatus are REQUIRED on every response — do not leave them blank or omit them. targetFirmware must name the vendor\'s current recommended/LTS stable release train for the EXACT platform identified (e.g. "Cisco IOS-XE 17.09.05 LTS", "FortiOS 7.4.x LTS"), based on real, current vendor lifecycle data for that platform. eolStatus must be either "Active / Supported" or "End-of-Life (EOL)", reflecting the DETECTED version\'s actual lifecycle status (not the recommended version\'s). ' +
-                'The only acceptable reason to not give a specific targetFirmware is if the vendor/OS platform itself cannot be identified from the input at all — in that exact case only, return targetFirmware "Unable to determine (unidentified platform)" and eolStatus "Unknown — verify with vendor". Do NOT invent CVEs for unrelated hardware vendors. ' +
-                // FIX (real bug, confirmed by hand): the model was returning
-                // CVE IDs that do not exist for the evaluated platform —
-                // e.g. CVE-2024-2005/2006/2007 for a Cisco IOS-XE 17.9.5
-                // device, none of which are real Cisco CVEs (CVE-2024-2005
-                // is not even a CVE — it's an unrelated Talos vulnerability
-                // report ID). Every cves[] entry is now independently
-                // verified against the NVD database after this call returns
-                // (see verifyCvesAgainstNvd below), but the model is also
-                // told directly not to guess, since prevention beats
-                // filtering.
-                'cves must only contain CVE identifiers you are genuinely confident are real, published vulnerabilities that apply to this exact vendor/platform AND hardware family and version range. Never invent a CVE ID, never approximate one, and never reuse an ID you loosely recall from a different product, a different vendor, or a non-CVE report (e.g. a Talos/PSIRT advisory number is NOT a CVE ID). ' +
-                // FIX (round 2, real bug, confirmed by hand): the model also
-                // returns CVE IDs that ARE real and ARE for Cisco, but for
-                // the WRONG Cisco product line — e.g. attaching an ASR 1000
-                // router CVE or a Small Business switch web-UI CVE to a
-                // Catalyst 9300 running IOS-XE. Being a real Cisco CVE
-                // number is not the same as applying to this exact
-                // hardware family; the model must actively rule that out,
-                // not just recall a plausible-looking ID.
-                'Before including any CVE, explicitly confirm it is scoped to the SAME hardware family and software platform as the device under analysis (e.g. Catalyst switch + IOS-XE is a different affected-product scope than ASR/ISR routers, and different again from the Small Business 200/300/500 switch line, even though all three are "Cisco"). If you are not certain a specific CVE applies to BOTH this vendor/platform AND this exact hardware family, omit it entirely — returning an empty cves array is the correct, expected answer when you have no high-confidence match, not a failure to avoid.',
-            },
-            {
-              role: 'user',
-              content: `Device Context:\n- Hostname: ${hostname}\n- Vendor / OS Platform: ${vendorType}\n\nCLI Show Version Output:\n${rawVersion}`,
-            },
-          ],
-          temperature: 0.0,
-          // FIX (real bug, confirmed by hand from your terminal log):
-          // Groq returned 400 json_validate_failed with an EMPTY
-          // failed_generation for this call. openai/gpt-oss-120b is a
-          // reasoning model — it spends output tokens on an internal
-          // reasoning pass before writing the actual JSON answer. With no
-          // max_tokens set, it has no guaranteed budget left for the
-          // answer itself after reasoning, especially on this endpoint's
-          // long system prompt (platform + hardware-family + CVE-accuracy
-          // rules combined) — it can exhaust the default token budget on
-          // reasoning alone and never emit the JSON, which is exactly
-          // "empty generation, fails JSON validation." Two mitigations:
-          // reasoning_effort caps how much the model spends on the hidden
-          // reasoning pass, and max_tokens guarantees headroom for the
-          // actual answer regardless. If this still 400s, the next
-          // terminal log will show it and we can tune further.
-          // reasoning_effort is only valid for the gpt-oss reasoning models.
-          ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
-          max_tokens: 2048,
-          response_format: { type: 'json_object' },
-        }),
-      });
-
-      // FIX (seen in your terminal): Groq answered 503 "over capacity" and
-      // the first failure went straight to the offline table. Now: try the
-      // main model, wait and try it again, then try a second model, before
-      // giving up. Same for 429 / network errors.
-      const GROQ_ATTEMPTS = ['openai/gpt-oss-120b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
-      let response: Response | null = null;
-      for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
-        try {
-          response = await callGroq(GROQ_ATTEMPTS[i]);
-        } catch (e) {
-          response = null;
-          console.warn(`[!] Groq attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) network error:`, e);
-        }
-        if (response && response.ok) break;
-        if (response) {
-          const body = await response.clone().text().catch(() => '');
-          console.warn(`[!] Groq attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${response.status}: ${body.slice(0, 200)}`);
-        }
-        if (i < GROQ_ATTEMPTS.length - 1) {
-          await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
-        }
-      }
-
-      if (response && response.ok) {
-        const data = await response.json();
-        const rawContent = (data.choices[0]?.message?.content || '{}')
-          .replace(/```json/g, '')
-          .replace(/```/g, '')
-          .trim();
-
-        const content = JSON.parse(rawContent);
-        const parsedLLMRisk = normalizeRiskLevel(content.riskLevel);
-        const rawCves = Array.isArray(content.cves) ? content.cves : [];
-        // FIX: verify every candidate CVE against NVD — both that it exists
-        // AND that its recorded CPE data actually names this platform
-        // family — before trusting it. See verifyCvesAgainstNvd doc
-        // comment above for why both checks are needed.
-        const cves = await verifyCvesAgainstNvd(rawCves, vendorType, rawVersion);
-
-        const staticFloor = getDeterministicFirmwareRisk(rawVersion, cves);
-        // FIX: clamp the AI's own self-rating to at most one step above the
-        // deterministic floor, same as scan/route.ts's Config tab — see
-        // clampAiRiskToFloor doc comment above for why (observed in
-        // practice: unclamped HIGH on a floor that only justified MEDIUM).
-        const { clamped: clampedAiRisk, wasClamped: riskWasClamped } = clampAiRiskToFloor(
-          parsedLLMRisk,
-          staticFloor
-        );
-        if (riskWasClamped) {
-          console.warn(
-            `[!] AI self-rated firmware risk (${parsedLLMRisk}) exceeded the deterministic floor (${staticFloor}) by more than one level for ${hostname}; clamped to ${clampedAiRisk}.`
-          );
-        }
-        const finalRisk = getHighestRiskLevel(staticFloor, clampedAiRisk);
-
-        return {
-          riskLevel: finalRisk,
-          rawAiRiskLevel: parsedLLMRisk,
-          staticFloorRisk: staticFloor,
-          riskWasClamped,
-          summary: content.summary || 'OS/Firmware evaluation completed.',
-          cves,
-          recommendations: Array.isArray(content.recommendations) ? content.recommendations : [],
-          // Trust the LLM's answer when it gave one; only fall back to the
-          // vendor-specific static guess for whichever field (if any) it
-          // still left blank despite the stricter prompt above.
-          targetFirmware:
-            typeof content.targetFirmware === 'string' && content.targetFirmware.trim()
-              ? content.targetFirmware.trim()
-              : fallback.targetFirmware,
-          eolStatus:
-            typeof content.eolStatus === 'string' && content.eolStatus.trim()
-              ? content.eolStatus.trim()
-              : fallback.eolStatus,
-        };
-      } else {
-        // FIX: a non-OK response (401 bad/missing key, 429 rate-limited,
-        // 400 bad request, 5xx Groq-side error) was previously swallowed
-        // completely silently — no console output at all, nothing to tell
-        // you WHY it fell back to the generic vendor placeholder. This was
-        // indistinguishable from "working as intended" in the logs.
-        console.warn('[!] Groq Firmware AI unavailable after all attempts. Using offline baseline (labelled as such).');
-      }
-    } catch (err) {
-      console.warn('[!] Groq Firmware AI call failed, falling back to vendor defaults:', err);
-    }
-  }
-
-  // FIX: the offline table is a generic baseline, NOT an assessment of this
-  // device. Before, it listed fixed CVE IDs as if they were findings (they
-  // were wrong for newer versions) and told the user to "upgrade" to a
-  // release that can be OLDER than the one installed. Now it reports no
-  // CVEs, gives no version advice, only the raw-version rule floor, and is
-  // clearly labelled so nobody mistakes it for an AI result.
-  const fallbackFloor = getDeterministicFirmwareRisk(rawVersion, []);
-
-  return {
-    riskLevel: fallbackFloor,
-    rawAiRiskLevel: fallbackFloor,
-    staticFloorRisk: fallbackFloor,
-    riskWasClamped: false,
-    summary:
-      'The AI service was unavailable, so no vulnerability or lifecycle assessment was made for this version. Click "Re-analyze Firmware" to try again.',
-    cves: [],
-    recommendations: fallback.recommendations.filter((r) => !/upgrade|update/i.test(r)),
-    targetFirmware: 'Unavailable (AI offline, retry)',
-    eolStatus: 'Unavailable (AI offline, retry)',
-    usedFallback: true,
+/** First dotted number pair in each string, compared at train level (major.minor). */
+function compareInstalledToTarget(installed: string, target: string): 'newer' | 'same' | 'older' | 'unknown' {
+  const parts = (t: string) => {
+    const m = t.match(/version[:\s]+v?(\d+(?:\.\d+){1,3})/i) || t.match(/(\d+(?:\.\d+){1,3})/);
+    return m ? m[1].split('.').map((n) => parseInt(n, 10)) : null;
   };
-}
-
-/**
- * NEW: plain version comparison (vendor-agnostic, no AI). Pulls the first
- * dotted number out of each text (e.g. "17.15.04c" -> [17,15,4]) and
- * compares the first 2 parts (train level). Returns 'newer' | 'same' |
- * 'older' | 'unknown'. Used so the report never tells someone to
- * "upgrade" to a release that is OLDER than the one installed.
- */
-function extractVersionParts(text: string): number[] | null {
-  const m =
-    text.match(/version[:\s]+v?(\d+(?:\.\d+){1,3})/i) ||
-    text.match(/(\d+(?:\.\d+){1,3})/);
-  if (!m) return null;
-  return m[1].split('.').map((n) => parseInt(n, 10));
-}
-
-function compareInstalledToTarget(
-  installedText: string,
-  targetText: string
-): 'newer' | 'same' | 'older' | 'unknown' {
-  const a = extractVersionParts(installedText);
-  const b = extractVersionParts(targetText);
+  const a = parts(installed);
+  const b = parts(target);
   if (!a || !b) return 'unknown';
   for (let i = 0; i < Math.min(2, a.length, b.length); i++) {
     if (a[i] > b[i]) return 'newer';
@@ -854,285 +75,156 @@ function compareInstalledToTarget(
   return 'same';
 }
 
+function cveLine(c: CveRecord): string {
+  const tags = [
+    c.kev ? `🚨 **ACTIVELY EXPLOITED** (CISA KEV since ${c.kevDateAdded}${c.kevRansomware ? ', used in ransomware' : ''})` : null,
+    c.cvssScore != null ? `CVSS ${c.cvssScore}${c.cvssSeverity ? ` ${c.cvssSeverity}` : ''}` : null,
+    c.epss != null ? `EPSS ${(c.epss * 100).toFixed(1)}%` : null,
+  ].filter(Boolean);
+  const desc = c.description ? c.description.slice(0, 280) + (c.description.length > 280 ? '…' : '') : '_No NVD description available; verify manually._';
+  const link = c.advisoryUrl || `https://nvd.nist.gov/vuln/detail/${c.id}`;
+  return `* **[${c.id}](${link})** — ${tags.join(' · ')}\n  ${desc}`;
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const deviceId = body.deviceId || body.device_id;
-    let rawVersion = body.rawVersion || body.raw_version || body.versionOutput;
+    const ctx = await requireUser(req, 'operator');
+    const body = FirmwareBody.parse(await readJson(req));
+    enforceRateLimit(ctx.userId, 'ai-firmware', 20);
+    const device = await requireDevice(ctx, body.deviceId, 'operator');
+    const admin = ctx.admin;
 
-    if (!deviceId) {
-      return NextResponse.json(
-        { success: false, error: 'Missing required field: deviceId' },
-        { status: 422 }
-      );
-    }
+    const rawVersion = body.rawVersion || device.raw_version || '';
+    if (!rawVersion.trim()) throw new HttpError(422, 'No "show version" output for this device. Collect telemetry first.');
+    const vendorType = detectVendor(body.vendor || device.netmiko_type || device.vendor || 'cisco_ios');
+    const hostname = device.hostname || 'Network-Device';
 
-    const supabase = getSupabaseAdmin();
-    let device: DeviceRecord = { hostname: 'Network-Device', vendor: 'generic' };
+    const ai = await groqJson<AiFirmware>({
+      label: 'firmware',
+      system: SYSTEM_PROMPT,
+      user: `Device Context:\n- Hostname: ${hostname}\n- Vendor / OS Platform: ${vendorType}\n\n${wrapUntrustedContent('show_version', rawVersion.slice(0, 8000))}`,
+      timeoutMs: 20000,
+    });
+    const aiCves = Array.isArray(ai?.data.cves) ? (ai!.data.cves as unknown[]).map(String) : [];
+    const intel = await lookupVulnerabilities(vendorType, rawVersion, aiCves);
 
-    if (supabase) {
-      const { data } = await supabase
-        .from('devices')
-        .select('*')
-        .eq('id', deviceId)
-        .maybeSingle();
+    const floor = firmwareRiskFloor(rawVersion, intel.cves);
+    const aiRisk = ai ? normalizeRiskLevel(ai.data.riskLevel, 'MEDIUM') : floor;
+    const { clamped, wasClamped } = clampAiRiskToFloor(aiRisk, floor);
+    const riskLevel: RiskLevel = getHighestRiskLevel(floor, clamped);
 
-      if (data) device = data as DeviceRecord;
+    const targetFirmware = ai?.data.targetFirmware?.trim() || 'Unavailable (AI offline, retry)';
+    const eolStatus = ai?.data.eolStatus?.trim() || 'Unavailable (AI offline, retry)';
+    const aiRecs = Array.isArray(ai?.data.recommendations) ? (ai!.data.recommendations as unknown[]).map(String) : FALLBACK_RECOMMENDATIONS[vendorType];
 
-      if (!rawVersion && device.raw_version) {
-        rawVersion = device.raw_version;
-      }
-    }
+    // One upgrade line built from targetFirmware so it can't contradict the
+    // hero card, and never "upgrade" to a train older than what's installed.
+    const comparison = compareInstalledToTarget(rawVersion, targetFirmware);
+    const upgradeLine = !ai
+      ? null
+      : comparison === 'newer'
+      ? `The installed release is **newer** than the recommended train (**${targetFirmware}**); no upgrade needed. Confirm the installed train is still supported.`
+      : comparison === 'same'
+      ? `The installed release is on the recommended train (**${targetFirmware}**). Apply the latest maintenance patch for that train.`
+      : `Upgrade to the vendor's recommended release, **${targetFirmware}**.`;
+    const recommendations = [
+      ...(upgradeLine ? [upgradeLine] : []),
+      ...aiRecs.filter((r) => !(/upgrade|update/i.test(r) && /\d+\.\d+/.test(r))),
+    ];
 
-    if (!rawVersion) {
-      rawVersion = `${device.hostname || 'Device'} OS Version Telemetry Default`;
-    }
+    const kevCount = intel.cves.filter((c) => c.kev).length;
+    const shown = intel.cves.slice(0, 25);
+    const cveSection = intel.cves.length
+      ? `${kevCount ? `> 🚨 **${kevCount} of these are being actively exploited (CISA KEV). Patch these first.**\n\n` : ''}${shown.map(cveLine).join('\n')}${
+          intel.cves.length > shown.length ? `\n\n_…and ${intel.cves.length - shown.length} more (ranked lower by exploitation and severity)._` : ''
+        }`
+      : intel.cpe
+      ? '✅ *NVD lists no CVEs for this exact platform and version.*'
+      : '⚠️ *This platform/version could not be mapped to a CPE name, so only AI-suggested CVEs (NVD-verified) were checked.*';
 
-    // FIX: was `device.netmiko_type || device.vendor || 'cisco_ios'` passed
-    // as a raw string straight to the Groq prompt and to getVendorFallback's
-    // own separate `.includes()` checks. Now resolved once, the same way
-    // cisBenchmarks.ts resolves it for the config-audit engine, so a device
-    // classified as e.g. aruba_hpe there is never silently treated as
-    // "generic" here.
-    const vendorInputStr = body.vendor || device.netmiko_type || device.vendor || 'cisco_ios';
-    const vendorType: VendorType = detectVendor(vendorInputStr);
-    const hostnameStr = device.hostname || 'Network-Device';
-
-    const analysis = await analyzeFirmwareWithGroq(hostnameStr, vendorType, rawVersion);
-
-    const riskBadge = analysis.riskLevel === 'CRITICAL' ? '🔴 CRITICAL' : analysis.riskLevel === 'HIGH' ? '🟠 HIGH' : analysis.riskLevel === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
-
-    // FIX: same grounding gap as scan/route.ts's "Hardening Action Items",
-    // applied here. `analysis.targetFirmware` and `analysis.recommendations`
-    // come back from the SAME single LLM JSON response, but as two
-    // separate fields the model wrote independently — nothing stops the
-    // model from naming one version in `targetFirmware` (the hero-card
-    // value) and a different, or just differently-worded, version inside
-    // its own free-text recommendations#1 ("Upgrade to ..."). That's not
-    // hypothetical: it's the exact failure mode the Version-tab hero-card
-    // bug turned out to be, one level up the stack from where that fix
-    // landed. Rather than trust the model to keep its own two answers in
-    // sync, drop whichever of its recommendations is itself a version-
-    // specific upgrade instruction, and replace it with one line built
-    // directly from the already-resolved `targetFirmware` value — so the
-    // hero card and this list can never disagree. Platform-agnostic: works
-    // the same for any of collector.py's 19 vendor types, since it only
-    // ever reads the already vendor-resolved `analysis.targetFirmware`.
-    const VERSION_LIKE_RE = /[0-9]+\.[0-9]+/;
-    const isVersionSpecificUpgradeLine = (rec: string): boolean =>
-      /upgrade|update/i.test(rec) && VERSION_LIKE_RE.test(rec);
-
-    // FIX: this line always said "Upgrade to ...", even when the installed
-    // release was NEWER than the AI's recommended train (seen on a device
-    // running 17.15.4c with a recommended "17.12.04a LTS"; the AI's own
-    // summary said "newer than the recommended LTS" while this line said
-    // "upgrade as soon as possible"). Now it compares the two first.
-    const versionCompare = compareInstalledToTarget(rawVersion, analysis.targetFirmware);
-    const groundedUpgradeLine =
-      versionCompare === 'newer'
-        ? `The installed release is **newer** than the recommended train (**${analysis.targetFirmware}**), so no upgrade is needed. Check the vendor's lifecycle page to confirm the installed train is still supported.`
-        : versionCompare === 'same'
-        ? `The installed release is on the recommended train (**${analysis.targetFirmware}**). Apply the latest maintenance patch for that train.`
-        : `Upgrade to the vendor's current recommended release, **${analysis.targetFirmware}**, as soon as possible.`;
-    const groundedRecommendations = analysis.usedFallback
-      ? analysis.recommendations
-      : [
-          groundedUpgradeLine,
-          ...analysis.recommendations.filter((r) => !isVersionSpecificUpgradeLine(r)),
-        ];
-
-    const formattedMarkdownSummary =
-`### 🔍 OS/Firmware Security Assessment
-${analysis.usedFallback ? '\n> ⚠️ **AI service unavailable (Groq overloaded). This is NOT an assessment of this device. Click "Re-analyze Firmware" to retry.**\n' : ''}
-* **Hostname:** ${hostnameStr}
-* **Vendor / Platform:** \`${vendorType}\`
-* **Evaluated Threat Level:** **${riskBadge}**${analysis.riskWasClamped ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device as **${analysis.rawAiRiskLevel}**, which was more than one level above what the verified findings (CVE count, EOL status) justify. The displayed rating was capped to **${analysis.riskLevel}**, the highest level the evidence currently supports.` : ''}
-* **Recommended LTS Release:** ${analysis.targetFirmware}
-* **Lifecycle Support Status:** ${analysis.eolStatus}
+    const osSummary = `### 🔍 OS/Firmware Security Assessment
+${!ai ? '\n> ⚠️ **AI service unavailable.** Lifecycle data below is not available; CVE data comes from NVD and is still valid.\n' : ''}
+* **Hostname:** ${hostname}
+* **Platform:** ${intel.platform ? `${intel.platform.label} ${intel.platform.version}${intel.platform.update ? ` ${intel.platform.update}` : ''}` : `\`${vendorType}\``}
+* **Evaluated Threat Level:** **${riskBadge(riskLevel)}**${wasClamped ? `\n* **⚠️ AI Rating Overridden:** the AI rated this **${aiRisk}**; capped at **${riskLevel}**, the highest the evidence supports.` : ''}
+* **Known CVEs:** ${intel.cves.length}${kevCount ? ` (**${kevCount} actively exploited**)` : ''}
+* **Recommended Release:** ${targetFirmware}
+* **Lifecycle Status:** ${eolStatus}
+* **Sources:** ${intel.sourcesQueried.join(', ') || 'none'}${intel.cpe ? ` · \`${intel.cpe}\`` : ''}${intel.errors.length ? `\n* **⚠️ Partial data:** ${intel.errors.join('; ')}` : ''}
 
 ---
 
 ### 📋 Executive OS Assessment
-> ${analysis.summary}
+> ${ai?.data.summary || 'AI narrative unavailable.'}
 
 ---
 
-### 🚨 Potential Known Vulnerabilities / CVEs (${analysis.cves.length})
+### 🚨 Known Vulnerabilities (${intel.cves.length})
 
-${
-  analysis.usedFallback
-    ? '⚠️ *CVE check skipped because the AI service was unavailable.*'
-    : analysis.cves.length > 0
-    // FIX (Fix C): show NVD's own verified description under each CVE
-    // instead of only the AI's unverified narrative claim about it — this
-    // is the actual ground-truth text, not a paraphrase.
-    ? analysis.cves
-        .map((c) => `* ⚠️ **${c.id}** — ${c.nvdDescription || '_No NVD description available for this CVE (lookup failed or record is sparse); verify manually before treating as confirmed impact._'}`)
-        .join('\n')
-    : '✅ *No critical baseline CVE matches identified for this OS image.*'
-}
+${cveSection}
 
 ---
 
 ### 💡 Lifecycle & Hardening Recommendations
-${groundedRecommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')}`;
+${recommendations.map((r, i) => `**${i + 1}.** ${r}`).join('\n')}`;
 
-    // FIX (schema-confirmed bug): public.scans.configuration_id is NOT NULL.
-    // The insert branch below used to write a scan with no configuration_id
-    // at all whenever a device had no prior scan row — that insert has
-    // always been rejected by the database, silently, because it's wrapped
-    // in the try/catch below. Firmware analysis run on a device before any
-    // config scan had ever completed could never actually persist a scan
-    // record. We now look up the device's most recent configuration and use
-    // its id; if none exists yet, we skip the write (can't satisfy the
-    // constraint) and say so plainly in the response instead of pretending
-    // it succeeded.
-    //
-    // Also fixed: `.eq('device_id', deviceId).limit(1)` with no `.order()`
-    // asks Postgres for "any one" matching row, not the most recent one —
-    // on a device with multiple scan rows this could update an old scan
-    // instead of the latest. Added `.order('created_at', { ascending: false })`.
-    //
-    // NEW: both the update and insert payloads below now also persist
-    // target_firmware/eol_status, so the AI-derived values survive a page
-    // refresh instead of fetchScanResults() hardcoding placeholder strings
-    // over them (see the matching fix in useDashboard.ts).
-    let dbPersisted = false;
+    // Persist onto the latest scan row (create one if the device has none).
     let dbWarning: string | null = null;
-
-    if (supabase) {
-      try {
-        const nowIso = new Date().toISOString();
-        const { data: existingScan } = await supabase
-          .from('scans')
-          .select('id')
-          .eq('device_id', deviceId)
-          .order('created_at', { ascending: false })
-          .limit(1);
-
-        if (existingScan && existingScan.length > 0) {
-          await supabase
-            .from('scans')
-            .update({
-              status: 'completed',
-              risk_level: analysis.riskLevel,
-              // FIX: was `summary:`. scans.summary belongs to the Config tab
-              // (api/scan writes its audit there). Writing OS text into the same
-              // column let each run overwrite the other tab's text. OS text now
-              // has its own column, scans.os_summary (see add_os_summary.sql).
-              os_summary: formattedMarkdownSummary,
-              target_firmware: analysis.targetFirmware,
-              eol_status: analysis.eolStatus,
-              updated_at: nowIso,
-            })
-            .eq('id', existingScan[0].id);
-          dbPersisted = true;
-        } else {
-          const { data: latestConfig } = await supabase
-            .from('configurations')
-            .select('id')
-            .eq('device_id', deviceId)
-            .order('created_at', { ascending: false })
-            .limit(1);
-
-          let configurationId = latestConfig?.[0]?.id ?? null;
-
-          // FIX: same gap as scan/route.ts — a device whose config lives
-          // only on devices.last_config (never run through a real "Collect
-          // Telemetry" pass) has no configurations row, so a firmware-only
-          // run (e.g. clicking "Run AI Assessment" before any config scan
-          // has ever completed for this device) could never persist
-          // anything, forever. Pull whatever config text the device record
-          // actually has and create a minimal snapshot from it so firmware
-          // history isn't silently lost. Vendor-agnostic — reads whichever
-          // of these columns the row actually has, same as scan/route.ts.
-          if (!configurationId) {
-            const { data: devRow } = await supabase
-              .from('devices')
-              .select('last_config, raw_config, config')
-              .eq('id', deviceId)
-              .maybeSingle();
-            const fallbackConfigText =
-              devRow?.last_config || devRow?.raw_config || devRow?.config || null;
-            if (fallbackConfigText) {
-              const { data: createdConfig } = await supabase
-                .from('configurations')
-                .insert({
-                  device_id: deviceId,
-                  raw_config: fallbackConfigText,
-                  created_at: nowIso,
-                })
-                .select('id')
-                .maybeSingle();
-              configurationId = createdConfig?.id ?? null;
-            }
-          }
-
-          if (configurationId) {
-            await supabase
-              .from('scans')
-              .insert({
-                device_id: deviceId,
-                configuration_id: configurationId,
-                status: 'completed',
-                risk_level: analysis.riskLevel,
-                summary: 'Telemetry collected; OS firmware analysis saved.',
-                os_summary: formattedMarkdownSummary,
-                target_firmware: analysis.targetFirmware,
-                eol_status: analysis.eolStatus,
-                created_at: nowIso,
-                updated_at: nowIso,
-              });
-            dbPersisted = true;
-          } else {
-            dbWarning = 'No configuration snapshot exists for this device yet, so the firmware analysis could not be saved as a scan record (scans.configuration_id is required). Run a config collection/scan first, then re-run firmware analysis.';
-            console.warn(`[!] Firmware analysis for ${deviceId} not persisted: no configuration row to reference.`);
-          }
-        }
-      } catch (dbErr) {
-        console.warn('[!] Firmware scan DB non-fatal write error:', dbErr);
-        dbWarning = 'Firmware analysis completed but could not be saved to the database.';
+    const now = new Date().toISOString();
+    const fields = { status: 'completed', risk_level: riskLevel, os_summary: osSummary, target_firmware: targetFirmware, eol_status: eolStatus, cve_details: intel.cves, updated_at: now };
+    const { data: latestScan } = await admin.from('scans').select('id').eq('device_id', device.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (latestScan) {
+      await admin.from('scans').update(fields).eq('id', latestScan.id);
+    } else {
+      const { data: latestConfig } = await admin.from('configurations').select('id').eq('device_id', device.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      let configurationId = latestConfig?.id ?? null;
+      if (!configurationId && device.last_config) {
+        const { data: created } = await admin.from('configurations').insert({ device_id: device.id, raw_config: device.last_config, source: 'manual' }).select('id').single();
+        configurationId = created?.id ?? null;
+      }
+      if (configurationId) {
+        await admin.from('scans').insert({ device_id: device.id, configuration_id: configurationId, summary: 'OS firmware analysis saved.', created_at: now, ...fields });
+      } else {
+        dbWarning = 'No configuration snapshot exists for this device yet, so the firmware analysis could not be saved. Collect telemetry first.';
       }
     }
 
+    // Alert on newly exploited CVEs: compare against the previous analysis.
+    if (kevCount) {
+      const { data: prior } = await admin.from('risk_history').select('kev_count').eq('device_id', device.id).eq('source', 'firmware').order('recorded_at', { ascending: false }).limit(1).maybeSingle();
+      if ((prior?.kev_count ?? 0) < kevCount) {
+        await queueAlert(admin, {
+          orgId: device.org_id,
+          deviceId: device.id,
+          kind: 'kev_detected',
+          severity: riskLevel === 'CRITICAL' ? 'CRITICAL' : 'HIGH',
+          title: `${hostname} runs firmware with ${kevCount} actively exploited CVE(s)`,
+          body: intel.cves.filter((c) => c.kev).slice(0, 10).map((c) => `• ${c.id} (CVSS ${c.cvssScore ?? '?'}) — KEV due ${c.kevDueDate}`).join('\n'),
+        });
+      }
+    }
+    await recordRisk(admin, { deviceId: device.id, riskLevel, source: 'firmware', cveCount: intel.cves.length, kevCount });
+    await audit(ctx, { action: 'scan.firmware', orgId: device.org_id, targetType: 'device', targetId: device.id, details: { riskLevel, cves: intel.cves.length, kev: kevCount } });
+
     return NextResponse.json({
       success: true,
-      deviceId,
-      riskLevel: analysis.riskLevel,
-      output: formattedMarkdownSummary,
-      summary: formattedMarkdownSummary,
-      osSummary: formattedMarkdownSummary,
-      analysis: formattedMarkdownSummary,
-      content: formattedMarkdownSummary,
-      text: formattedMarkdownSummary,
-      result: formattedMarkdownSummary,
-      // FIX: kept as plain string[] for backward compatibility with
-      // whatever already reads data.cves (e.g. VersionTab.tsx) expecting
-      // bare CVE ID strings — changing this shape without seeing that
-      // file's current code could silently break its rendering (a mapped
-      // object would show as "[object Object]"). The new verified
-      // descriptions (Fix C) are additive, in cveDetails below.
-      cves: analysis.cves.map((c) => c.id),
-      // NEW (Fix C): each verified CVE's real NVD description alongside
-      // its id — use this in the UI instead of cves[] wherever you want
-      // to show ground-truth impact text rather than just the bare ID.
-      cveDetails: analysis.cves,
-      aiAnalysis: analysis,
-      // NEW: these two are what useDashboard.ts's handleAnalyzeFirmware()
-      // was already trying to read (data.targetFirmware / data.eolStatus) —
-      // it just never received them before now.
-      targetFirmware: analysis.targetFirmware,
-      eolStatus: analysis.eolStatus,
-      // FIX: surfaced instead of pretending the write always succeeds (see note above)
-      dbPersisted,
+      deviceId: device.id,
+      riskLevel,
+      osSummary,
+      output: osSummary,
+      summary: osSummary,
+      cves: intel.cves.map((c) => c.id),
+      cveDetails: intel.cves,
+      cpe: intel.cpe,
+      kevCount,
+      targetFirmware,
+      eolStatus,
+      aiAnalysis: { rawAiRiskLevel: aiRisk, staticFloorRisk: floor, riskWasClamped: wasClamped, usedFallback: !ai },
+      dataErrors: intel.errors,
+      dbPersisted: !dbWarning,
       dbWarning,
     });
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : 'Internal Server Error';
-    console.error('[-] Error executing firmware analysis in /api/analyze-firmware:', err);
-    return NextResponse.json(
-      { success: false, error: errorMessage },
-      { status: 500 }
-    );
+    return routeError(err, 'POST /api/analyze-firmware');
   }
 }

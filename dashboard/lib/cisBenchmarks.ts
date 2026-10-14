@@ -837,3 +837,15 @@ function stripCommentLines(rawConfig: string): string {
     })
     .join('\n');
 }
+
+/** Rule ids the engine evaluates for a platform. */
+export function applicableRuleIds(vendorInput: string): string[] {
+  const vendor = detectVendor(vendorInput);
+  return CIS_BENCHMARK_MATRIX.filter((r) => (!r.appliesTo || r.appliesTo.includes(vendor)) && (r.vendors[vendor] || r.vendors.generic)).map((r) => r.ruleId);
+}
+
+/** Resolves a stored finding (rule_id, or title for rows saved before rule_id existed). */
+export function resolveRuleId(ruleId: string | null | undefined, title: string | null | undefined): string | null {
+  if (ruleId && CIS_BENCHMARK_MATRIX.some((r) => r.ruleId === ruleId)) return ruleId;
+  return CIS_BENCHMARK_MATRIX.find((r) => r.title === title)?.ruleId ?? null;
+}

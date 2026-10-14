@@ -1,121 +1,27 @@
-//C:\Users\hp\aiops-securewatch\dashboard\app\api\analyze-impact\route.ts
+// dashboard/app/api/analyze-impact/route.ts
+// Change-impact simulation for a proposed CLI change. A deterministic
+// keyword floor guarantees that commands which can reboot a device or cut
+// management access are never shown as LOW, whatever the AI says.
 import { NextRequest, NextResponse } from 'next/server';
-import { scanForPromptInjection, wrapUntrustedContent, PromptInjectionScanResult } from '@/lib/security';
+import { scanForPromptInjection, wrapUntrustedContent } from '@/lib/security';
+import { sanitizeConfig } from '@/lib/sanitizer';
+import { requireUser, requireDevice } from '@/lib/auth';
+import { audit } from '@/lib/audit';
+import { enforceRateLimit } from '@/lib/rateLimit';
+import { ImpactBody } from '@/lib/validation';
+import { readJson, routeError } from '@/lib/http';
+import { groqJson } from '@/lib/groq';
+import { generateSmartRollback } from '@/lib/rollback';
+import { getHighestRiskLevel, normalizeRiskLevel, riskBadge, type RiskLevel } from '@/lib/risk';
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL ||  'openai/gpt-oss-120b';
-
-export type ImpactLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-export type DisruptionRisk = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-
-interface ImpactAnalysisResult {
-  impactLevel: ImpactLevel;
-  disruptionRisk: DisruptionRisk;
-  analysis: string;
-  rollbackCommands: string[];
-  narrative?: string;
-}
-
-function normalizeImpactLevel(val?: string): ImpactLevel {
-  const normalized = String(val || '').toUpperCase();
-  if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(normalized)) {
-    return normalized as ImpactLevel;
-  }
-  return 'MEDIUM';
-}
-
-function normalizeDisruptionRisk(val?: string): DisruptionRisk {
-  const normalized = String(val || '').toUpperCase();
-  if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(normalized)) {
-    return normalized as DisruptionRisk;
-  }
-  return 'MEDIUM';
-}
-
-/**
- * Line-by-line CLI syntax reversal engine for fallback execution.
- */
-function generateSmartRollback(cliCommand: string, vendor: string = 'generic'): string[] {
-  const lines = cliCommand.split('\n').map((l) => l.trim()).filter(Boolean);
-  const rollbackLines: string[] = [];
-
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-
-    // 1. Destructive / Irreversible Operations
-    if (
-      lower.includes('reload') ||
-      lower.includes('reboot') ||
-      lower.includes('erase') ||
-      lower.includes('write erase')
-    ) {
-      rollbackLines.push(`! Reversal not possible via CLI for destructive operation: "${line}"`);
-      continue;
-    }
-
-    // 2. Context Headers (Interfaces, Line VTY, Router, VLAN)
-    if (
-      lower.startsWith('interface ') ||
-      lower.startsWith('line ') ||
-      lower.startsWith('router ') ||
-      lower.startsWith('vlan ') ||
-      lower.startsWith('policy-map ')
-    ) {
-      rollbackLines.push(line);
-      continue;
-    }
-
-    // 3. Invert "no <command>" -> "<command>"
-    if (lower.startsWith('no ')) {
-      const inverted = line.substring(3).trim();
-      rollbackLines.push(inverted);
-      continue;
-    }
-
-    // 4. Invert "shutdown" -> "no shutdown"
-    if (lower === 'shutdown') {
-      rollbackLines.push('no shutdown');
-      continue;
-    }
-
-    // 5. Invert "<command>" -> "no <command>"
-    rollbackLines.push(`no ${line}`);
-  }
-
-  return rollbackLines.length > 0
-    ? rollbackLines
-    : ['! Manual configuration inspection required for rollback.'];
-}
-
-const IMPACT_RANKS: Record<ImpactLevel, number> = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
-
-function higherOf(a: ImpactLevel, b: ImpactLevel): ImpactLevel {
-  return IMPACT_RANKS[a] >= IMPACT_RANKS[b] ? a : b;
-}
-
-/**
- * NEW: deterministic minimum impact, same idea as the "floor" on the Config
- * and Version tabs. Plain keyword rules, no AI, vendor-agnostic (these words
- * mean the same thing on every CLI this system supports). The AI can rate
- * a command HIGHER than this, but never lower, so a command that can cut
- * access or reboot a device can never be shown as LOW because the AI was
- * wrong or offline.
- */
-function getDeterministicImpactFloor(cliCommand: string): ImpactLevel {
-  const lines = cliCommand.split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean);
-  let floor: ImpactLevel = 'LOW';
-
-  for (const line of lines) {
-    // CRITICAL: reboots / wipes - service down or config lost
-    if (
-      /\b(reload|reboot|erase|zeroize|factory[- ]?reset)\b/.test(line) ||
-      /^format\b/.test(line) ||
-      /^delete\s+(\/force\s+)?(flash|bootflash|nvram|startup|disk)/.test(line)
-    ) {
+function getDeterministicImpactFloor(cliCommand: string): RiskLevel {
+  let floor: RiskLevel = 'LOW';
+  for (const line of cliCommand.split('\n').map((l) => l.trim().toLowerCase()).filter(Boolean)) {
+    // Reboots and wipes: service down or config lost.
+    if (/\b(reload|reboot|erase|zeroize|factory[- ]?reset)\b/.test(line) || /^format\b/.test(line) || /^delete\s+(\/force\s+)?(flash|bootflash|nvram|startup|disk)/.test(line)) {
       return 'CRITICAL';
     }
-
-    // HIGH: can lock you out of the device or drop a link
+    // Can lock you out of the device or drop a link.
     if (
       /^no\s+(aaa\s+new-model|ip\s+ssh|ssh\b|username\b|enable\b)/.test(line) ||
       /^transport\s+input\s+(none|telnet)/.test(line) ||
@@ -123,283 +29,101 @@ function getDeterministicImpactFloor(cliCommand: string): ImpactLevel {
       /^shutdown$/.test(line) ||
       /\baccess-class\b/.test(line)
     ) {
-      floor = higherOf(floor, 'HIGH');
+      floor = getHighestRiskLevel(floor, 'HIGH');
       continue;
     }
-
-    // MEDIUM: routing / ACL / addressing / VLAN changes can interrupt traffic
-    if (
-      /^(no\s+)?(ip\s+route|ip\s+address|ip\s+access-list|access-list|vlan\b|spanning-tree|router\s+\w+|snmp-server|ntp\b)/.test(line) ||
-      /default-gateway/.test(line)
-    ) {
-      floor = higherOf(floor, 'MEDIUM');
+    // Routing / ACL / addressing / VLAN changes can interrupt traffic.
+    if (/^(no\s+)?(ip\s+route|ip\s+address|ip\s+access-list|access-list|vlan\b|spanning-tree|router\s+\w+|snmp-server|ntp\b)/.test(line) || /default-gateway/.test(line)) {
+      floor = getHighestRiskLevel(floor, 'MEDIUM');
     }
   }
   return floor;
 }
 
-/**
- * Standardizes output markdown layout for UI rendering.
- */
-function buildFormattedMarkdown(
-  vendor: string,
-  impactLevel: ImpactLevel,
-  disruptionRisk: DisruptionRisk,
-  analysisNarrative: string,
-  rollbackCommands: string[]
-): string {
-  const impactBadge =
-    impactLevel === 'CRITICAL'
-      ? '🔴 CRITICAL'
-      : impactLevel === 'HIGH'
-      ? '🟠 HIGH'
-      : impactLevel === 'MEDIUM'
-      ? '🟡 MEDIUM'
-      : '🟢 LOW';
-
-  const riskBadge =
-    disruptionRisk === 'CRITICAL'
-      ? '🔴 CRITICAL'
-      : disruptionRisk === 'HIGH'
-      ? '🟠 HIGH'
-      : disruptionRisk === 'MEDIUM'
-      ? '🟡 MEDIUM'
-      : '🟢 LOW';
-
-  const rollbackBlock = rollbackCommands.length > 0
-    ? rollbackCommands.join('\n')
-    : '! Manual configuration verification required.';
-
+function buildMarkdown(vendor: string, impact: RiskLevel, disruption: RiskLevel, narrative: string, rollback: string[]): string {
   return `### 📊 CLI Command Impact Assessment
 
-* **Target OS Platform:** \`${vendor || 'Generic Network OS'}\`
-* **Evaluated Impact Level:** **${impactBadge}**
-* **Disruption Risk:** **${riskBadge}**
+* **Target OS Platform:** \`${vendor}\`
+* **Evaluated Impact Level:** **${riskBadge(impact)}**
+* **Disruption Risk:** **${riskBadge(disruption)}**
 
 ---
 
 ### 🔍 Operational Impact Breakdown
-> ${analysisNarrative}
+> ${narrative}
 
 ---
 
-### 🔄 Disaster Recovery Rollback Script
-*Execute these CLI commands to revert changes if service is disrupted:*
+### 🔄 Rollback Script
+*Review before use. Execute to revert the change if service is disrupted:*
 
 \`\`\`cli
-${rollbackBlock}
+${rollback.length ? rollback.join('\n') : '! Manual configuration verification required.'}
 \`\`\``;
-}
-
-function fallbackImpactAnalysis(cliCommand: string, vendor?: string): ImpactAnalysisResult {
-  const cmdLower = cliCommand.toLowerCase().trim();
-  // FIX: used to be .includes('shutdown'), which also matched the SAFE
-  // command "no shutdown" and rated it HIGH/CRITICAL. Now matches a line
-  // that IS "shutdown" only.
-  const isDestructive =
-    cmdLower.includes('reload') ||
-    cmdLower.includes('reboot') ||
-    cmdLower.split('\n').some((l) => l.trim() === 'shutdown') ||
-    cmdLower.includes('delete') ||
-    cmdLower.includes('erase');
-
-  const rollbackCommands = generateSmartRollback(cliCommand, vendor);
-
-  // FIX: the old text said "Standard Operations Command. Low probability of
-  // core network disruption" for ANY command without a few keywords, even
-  // though no AI had looked at it. It is now labelled as what it is: a
-  // keyword check, shown only when the AI service is unavailable.
-  const narrative = isDestructive
-    ? '⚠️ **AI service unavailable - keyword check only.** This command contains a disruptive keyword (reload / reboot / shutdown / delete / erase) and may interrupt service.'
-    : '⚠️ **AI service unavailable - keyword check only.** No disruptive keyword was found, but no AI review was done. Review the command manually before applying. Click Analyze again to retry.';
-
-  const formattedAnalysis = buildFormattedMarkdown(
-    vendor || 'Generic Device',
-    isDestructive ? 'HIGH' : 'LOW',
-    isDestructive ? 'CRITICAL' : 'LOW',
-    narrative,
-    rollbackCommands
-  );
-
-  return {
-    impactLevel: isDestructive ? 'HIGH' : 'LOW',
-    disruptionRisk: isDestructive ? 'CRITICAL' : 'LOW',
-    analysis: formattedAnalysis,
-    rollbackCommands,
-    narrative,
-  };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const { proposedCommand, proposed_cli, vendor, activeConfig } = body;
+    const ctx = await requireUser(req, 'operator');
+    const body = ImpactBody.parse(await readJson(req));
+    enforceRateLimit(ctx.userId, 'ai-impact', 30);
 
-    const cliCommand = (proposedCommand || proposed_cli || '').trim();
-
-    if (!cliCommand) {
-      return NextResponse.json(
-        { success: false, error: 'A CLI command (proposedCommand or proposed_cli) is required.' },
-        { status: 400 }
-      );
+    let vendor = body.vendor || 'Generic Network OS';
+    let activeConfig = body.activeConfig || '';
+    let orgId: string | null = null;
+    if (body.deviceId) {
+      const device = await requireDevice(ctx, body.deviceId, 'operator');
+      vendor = body.vendor || device.netmiko_type || device.vendor || vendor;
+      activeConfig = activeConfig || device.last_config || '';
+      orgId = device.org_id;
     }
 
-    // FIX: both gates below used to return 422 and refuse the whole request.
-    // For the pasted-in device config (configScan) that's the same problem
-    // as in api/scan/route.ts: it's attacker-influenceable data, so blocking
-    // on a match lets an attacker silently make this endpoint useless for a
-    // tampered device. For the operator-typed command (commandScan) a false
-    // positive (e.g. a command that legitimately contains the word "system:")
-    // would otherwise block a real operator action with no way around it.
-    // Both are now flags surfaced in the response, not hard stops. The
-    // config text is wrapped in an explicit untrusted-data boundary before
-    // it reaches the LLM prompt, which is the actual mitigation.
+    const cliCommand = body.proposedCommand.trim();
+    // Detectors, not gates (see lib/security.ts).
     const commandScan = scanForPromptInjection(cliCommand);
+    const configScan = activeConfig ? scanForPromptInjection(activeConfig) : { flagged: false };
+    const configContext = activeConfig.trim()
+      ? wrapUntrustedContent('active_device_configuration', sanitizeConfig(activeConfig).slice(0, 4000))
+      : 'No active device configuration supplied. Analyze command impact using syntax and vendor defaults.';
 
-    let configContext = 'No active device configuration supplied. Analyze command impact using syntax and vendor defaults.';
-    let configScan: PromptInjectionScanResult = { flagged: false };
-    if (typeof activeConfig === 'string' && activeConfig.trim() !== '') {
-      configScan = scanForPromptInjection(activeConfig);
-      configContext = wrapUntrustedContent('active_device_configuration', activeConfig.slice(0, 4000));
-    }
+    const ai = await groqJson<{ impactLevel?: string; disruptionRisk?: string; analysis?: string; rollbackCommands?: unknown }>({
+      label: 'impact',
+      system: `You are a network infrastructure safety auditor. Analyze proposed CLI commands against the target running configuration for ${vendor}.
+Return JSON ONLY with keys: impactLevel (CRITICAL|HIGH|MEDIUM|LOW), disruptionRisk (CRITICAL|HIGH|MEDIUM|LOW), analysis (markdown explaining operational impact, risks and syntax validity), rollbackCommands (array of CLI commands that revert the change line by line).
+Rollback rules: invert 'no <cmd>' to '<cmd>' and '<cmd>' to 'no <cmd>'; invert 'shutdown' to 'no shutdown'; keep context headers such as 'interface Ethernet1/1' or 'line vty 0 15'.`,
+      user: `Vendor OS: ${vendor}\n\nRunning Configuration Context:\n${configContext}\n\nProposed CLI Command:\n${sanitizeConfig(cliCommand)}`,
+      temperature: 0.1,
+    });
 
-    let parsedResult: Partial<ImpactAnalysisResult> | null = null;
-    const vendorName = vendor || 'Generic Network OS';
+    const floor = getDeterministicImpactFloor(cliCommand);
+    const keywordDestructive = floor === 'CRITICAL' || floor === 'HIGH';
+    const impactLevel = getHighestRiskLevel(floor, ai ? normalizeRiskLevel(ai.data.impactLevel, 'MEDIUM') : keywordDestructive ? 'HIGH' : 'LOW');
+    const disruptionRisk = getHighestRiskLevel(floor, ai ? normalizeRiskLevel(ai.data.disruptionRisk, 'MEDIUM') : keywordDestructive ? 'CRITICAL' : 'LOW');
+    const aiRollback = Array.isArray(ai?.data.rollbackCommands) ? (ai!.data.rollbackCommands as unknown[]).map(String).filter(Boolean) : [];
+    const rollbackCommands = aiRollback.length ? aiRollback : generateSmartRollback(cliCommand, vendor);
+    const narrative =
+      ai?.data.analysis ||
+      (keywordDestructive
+        ? '⚠️ **AI service unavailable — keyword check only.** This command can interrupt service or cut management access.'
+        : '⚠️ **AI service unavailable — keyword check only.** No disruptive keyword was found, but no AI review was done. Review manually before applying.');
 
-    if (GROQ_API_KEY) {
-      try {
-        const systemPrompt = `You are a network infrastructure safety auditor. Analyze proposed CLI commands against target running configurations for ${vendorName}.
-Return JSON ONLY with keys:
-- impactLevel (CRITICAL|HIGH|MEDIUM|LOW)
-- disruptionRisk (CRITICAL|HIGH|MEDIUM|LOW)
-- analysis (markdown string explaining operational impact, risks, syntax validity)
-- rollbackCommands (array of string CLI commands to revert changes line-by-line).
-
-STRICT ROLLBACK RULES:
-1. Generate line-by-line inverse CLI commands in 'rollbackCommands'.
-2. Invert 'no <cmd>' to '<cmd>' and '<cmd>' to 'no <cmd>'.
-3. Invert 'shutdown' to 'no shutdown'.
-4. Preserve context headers like 'interface Ethernet1/1' or 'line vty 0 15'.`;
-
-        const userPrompt = `Vendor OS: ${vendorName}\n\nRunning Configuration Context:\n${configContext}\n\nProposed CLI Command:\n${cliCommand}`;
-
-        const callGroq = (model: string) =>
-          fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${GROQ_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model,
-              response_format: { type: 'json_object' },
-              temperature: 0.1,
-              // FIX: same as the other two routes - gpt-oss is a reasoning
-              // model and can use its whole token budget thinking, then
-              // return an empty answer. Cap the thinking, guarantee room.
-              ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
-              max_tokens: 2048,
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt },
-              ],
-            }),
-          });
-
-        // FIX: Groq sometimes answers 503 "over capacity" or 429. That used
-        // to be ignored with no log and no retry. Now: main model, wait and
-        // retry, then a second model, logging every failed attempt.
-        const GROQ_ATTEMPTS = [GROQ_MODEL, GROQ_MODEL, 'llama-3.3-70b-versatile'];
-        let groqRes: Response | null = null;
-        for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
-          try {
-            groqRes = await callGroq(GROQ_ATTEMPTS[i]);
-          } catch (e) {
-            groqRes = null;
-            console.warn(`[!] Groq impact attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) failed:`, e);
-          }
-          if (groqRes && groqRes.ok) break;
-          if (groqRes) {
-            const errBody = await groqRes.clone().text().catch(() => '');
-            console.warn(`[!] Groq impact attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${groqRes.status}: ${errBody.slice(0, 200)}`);
-          }
-          if (i < GROQ_ATTEMPTS.length - 1) {
-            await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
-          }
-        }
-
-        if (groqRes && groqRes.ok) {
-          const groqData = await groqRes.json();
-          const rawContent = (groqData.choices[0]?.message?.content || '{}')
-            .replace(/```json/g, '')
-            .replace(/```/g, '')
-            .trim();
-          parsedResult = JSON.parse(rawContent);
-        }
-      } catch (err) {
-        console.warn('[!] Groq impact analysis failed, utilizing fallback:', err);
-      }
-    }
-
-    const fallback = fallbackImpactAnalysis(cliCommand, vendorName);
-
-    const usedFallback = !parsedResult;
-    const commandFloor = getDeterministicImpactFloor(cliCommand);
-
-    // The AI answer (or the keyword fallback) can never go BELOW the
-    // deterministic floor for this command.
-    const finalImpactLevel = higherOf(
-      commandFloor,
-      parsedResult?.impactLevel ? normalizeImpactLevel(parsedResult.impactLevel) : fallback.impactLevel
-    );
-
-    const finalDisruptionRisk = higherOf(
-      commandFloor,
-      parsedResult?.disruptionRisk ? normalizeDisruptionRisk(parsedResult.disruptionRisk) : fallback.disruptionRisk
-    );
-
-    const rawRollback = Array.isArray(parsedResult?.rollbackCommands) && parsedResult.rollbackCommands.length > 0
-      ? parsedResult.rollbackCommands
-      : fallback.rollbackCommands;
-
-    const rawNarrative = parsedResult?.analysis || fallback.narrative || 'CLI operational impact analysis completed.';
-
-    // Construct unified Markdown payload
-    const formattedMarkdown = buildFormattedMarkdown(
-      vendorName,
-      finalImpactLevel,
-      finalDisruptionRisk,
-      rawNarrative,
-      rawRollback
-    );
+    const analysis = buildMarkdown(vendor, impactLevel, disruptionRisk, narrative, rollbackCommands);
+    await audit(ctx, { action: 'simulate.impact', orgId, targetType: 'device', targetId: body.deviceId ?? null, details: { impactLevel, lines: cliCommand.split('\n').length } });
 
     return NextResponse.json({
       success: true,
       proposedCommand: cliCommand,
-      impactLevel: finalImpactLevel,
-      disruptionRisk: finalDisruptionRisk,
-      analysis: formattedMarkdown,
-      output: formattedMarkdown,
-      summary: formattedMarkdown,
-      rollbackCommands: rawRollback,
-      // FIX: surfaced instead of silently 422-ing the request (see note above)
-      aiUnavailable: usedFallback,
-      deterministicFloor: commandFloor,
+      impactLevel,
+      disruptionRisk,
+      analysis,
+      output: analysis,
+      rollbackCommands,
+      aiUnavailable: !ai,
+      deterministicFloor: floor,
       promptInjectionFlagged: commandScan.flagged || configScan.flagged,
-      promptInjectionSource: commandScan.flagged && configScan.flagged
-        ? 'command_and_config'
-        : commandScan.flagged
-        ? 'command'
-        : configScan.flagged
-        ? 'config'
-        : null,
+      promptInjectionSource: commandScan.flagged && configScan.flagged ? 'command_and_config' : commandScan.flagged ? 'command' : configScan.flagged ? 'config' : null,
     });
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
-    console.error('[-] Error in /api/analyze-impact:', error);
-    return NextResponse.json(
-      { success: false, error: errorMessage },
-      { status: 500 }
-    );
+  } catch (err) {
+    return routeError(err, 'POST /api/analyze-impact');
   }
 }

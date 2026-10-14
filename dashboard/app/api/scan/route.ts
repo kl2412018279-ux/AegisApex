@@ -1,637 +1,308 @@
-// C:\Users\hp\aiops-securewatch\dashboard\app\api\scan\route.ts
+// dashboard/app/api/scan/route.ts
+// Configuration audit: deterministic CIS rules decide the risk floor, the
+// LLM adds an executive summary and may raise the rating by at most one
+// step (never above the evidence when the floor is LOW).
 import { NextRequest, NextResponse } from 'next/server';
-import { getSupabaseAdmin } from '@/lib/supabase';
-import {
-  evaluateConfigDeterministically,
-  detectVendor,
-  ValidatedFinding
-} from '@/lib/cisBenchmarks';
+import { evaluateConfigDeterministically, detectVendor, FRAMEWORK_LABELS, type ValidatedFinding } from '@/lib/cisBenchmarks';
 import { sanitizeConfig } from '@/lib/sanitizer';
 import { scanForPromptInjection, wrapUntrustedContent } from '@/lib/security';
+import { requireUser, requireDevice } from '@/lib/auth';
+import { audit } from '@/lib/audit';
+import { enforceRateLimit } from '@/lib/rateLimit';
+import { ScanBody } from '@/lib/validation';
+import { readJson, routeError, HttpError } from '@/lib/http';
+import { groqJson } from '@/lib/groq';
+import { clampAiRiskToFloor, getHighestRiskLevel, normalizeRiskLevel, riskBadge, severityTitleCase, type RiskLevel } from '@/lib/risk';
+import { recordRisk } from '@/lib/riskHistory';
 
-export type RiskLevel = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-
-interface LlmAnalysisResult {
+interface LlmAnalysis {
   summary: string;
   recommendations: string[];
-  llmRiskLevel?: RiskLevel;
+  llmRiskLevel: RiskLevel;
+  aiAvailable: boolean;
 }
 
-const RISK_RANKS: Record<RiskLevel, number> = {
-  CRITICAL: 4,
-  HIGH: 3,
-  MEDIUM: 2,
-  LOW: 1,
-};
+const SYSTEM_PROMPT = [
+  'You are a Principal Network Security Architect. Analyze the device configuration and static CIS audit findings.',
+  'Provide a concise Executive Summary (2-3 sentences on systemic risk) and 3-5 vendor-specific hardening recommendations.',
+  'Return ONLY valid JSON with keys: "summary" (string), "recommendations" (string array), and "riskLevel" ("CRITICAL"|"HIGH"|"MEDIUM"|"LOW").',
+  // The model once recommended removing a VLAN from a trunk it was never on.
+  'Every claim must be grounded in the literal configuration text below — never say a VLAN, interface, ACL or feature appears somewhere unless you can quote the exact command or interface it appears under.',
+  'Before recommending that a VLAN be removed from a trunk, re-read that trunk\'s own "switchport trunk allowed vlan" line and confirm the VLAN is present.',
+  'A shut-down port assigned to an otherwise unused VLAN is a standard "blackhole VLAN" hardening pattern, not a gap.',
+  // The model was never given line numbers, so any it cites are invented.
+  'You are NOT given line numbers, so NEVER cite one. Point to configuration by quoting the interface name or command text instead.',
+].join(' ');
 
-function getHighestRiskLevel(riskA: RiskLevel, riskB: RiskLevel): RiskLevel {
-  const rankA = RISK_RANKS[riskA] ?? 1;
-  const rankB = RISK_RANKS[riskB] ?? 1;
-  return rankA >= rankB ? riskA : riskB;
-}
+const LINE_CITATION_RE = /\s*\(?\s*lines?\s+\d+\s*(?:[-–‑]\s*\d+)?[^)]*\)?/gi;
 
-/**
- * FIX (safety net, not the primary fix — see the system-prompt instruction
- * above): in case the model still writes a fabricated line-number citation
- * despite being told not to, this strips any "(line NN...)" / "(lines
- * NN-MM...)" fragment out of an AI-written recommendation before it reaches
- * the UI, and logs it so that's visible instead of silently rewriting what
- * the model said with no trace.
- */
+/** Safety net for the no-line-numbers instruction: strip and log any that slip through. */
 function stripFabricatedLineCitations(recommendations: string[]): string[] {
-  const LINE_CITATION_RE = /\s*\(?\s*lines?\s+\d+\s*(?:[-–‑]\s*\d+)?[^)]*\)?/gi;
   return recommendations.map((rec) => {
     const cleaned = rec.replace(LINE_CITATION_RE, '').replace(/\s{2,}/g, ' ').trim();
-    if (cleaned !== rec.trim()) {
-      console.warn(
-        `[!] Stripped a fabricated line-number citation from an AI recommendation (model ignored the no-line-numbers instruction): "${rec}"`
-      );
-    }
-    return cleaned || rec; // never emit a blank recommendation
+    if (cleaned !== rec.trim()) console.warn(`[!] Stripped a fabricated line citation from an AI recommendation: "${rec}"`);
+    return cleaned || rec;
   });
 }
 
-function normalizeRiskLevel(val?: string): RiskLevel {
-  const normalized = String(val || '').toUpperCase();
-  if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(normalized)) {
-    return normalized as RiskLevel;
-  }
-  return 'LOW';
-}
-
-/**
- * FIX (hallucination ceiling): the hybrid calculation used to be
- * max(deterministic CIS floor, AI self-rated risk) with nothing else —
- * that stops the AI from UNDER-rating a config (it can never go below
- * the floor), but did nothing to stop it from OVER-rating one. An AI
- * that hallucinates "CRITICAL" on a config whose actual static findings
- * only justify LOW would previously flow straight through to the
- * Inventory tab unchecked.
- *
- * This clamps the AI's own contribution to at most one severity step
- * above the deterministic floor. The AI can still raise the risk above
- * the floor — it may have spotted something real that the static CIS
- * ruleset doesn't cover — but it can no longer single-handedly jump a
- * device from LOW to CRITICAL on self-rating alone. Every time this
- * clamp actually fires, it's logged and surfaced in the API response
- * (aiAnalysis.riskWasClamped) rather than silently corrected, so it's
- * visible during testing and explainable in a viva.
- *
- * FIX (confirmed by hand, repeatedly, on a config with 0 CIS violations):
- * the +1-level margin above the floor was being applied even when the
- * floor itself is LOW — meaning a fully compliant config (0 violations)
- * could still be bumped to MEDIUM on nothing but the AI's own opinion
- * (observed: it decided a /24 management ACL was "too broad", with no
- * rule or evidence backing that). That one-step benefit of the doubt
- * makes sense when there's already some real evidence to argue from (a
- * MEDIUM or HIGH floor, where the AI may have spotted something extra the
- * static ruleset doesn't cover) — but when the floor is LOW, there is by
- * definition no violation to extrapolate from, so the margin only ever
- * lets the AI invent risk out of nothing. A LOW floor now allows no
- * margin at all; MEDIUM/HIGH/CRITICAL floors keep the existing +1 step.
- */
-function clampAiRiskToFloor(
-  aiRisk: RiskLevel,
-  floorRisk: RiskLevel
-): { clamped: RiskLevel; wasClamped: boolean } {
-  const floorRank = RISK_RANKS[floorRisk] ?? 1;
-  const aiRank = RISK_RANKS[aiRisk] ?? 1;
-  const margin = floorRisk === 'LOW' ? 0 : 1;
-  const ceilingRank = Math.min(4, floorRank + margin);
-
-  if (aiRank <= ceilingRank) {
-    return { clamped: aiRisk, wasClamped: false };
-  }
-
-  const rankToLevel = (rank: number): RiskLevel =>
-    (Object.keys(RISK_RANKS) as RiskLevel[]).find((k) => RISK_RANKS[k] === rank) || 'LOW';
-
-  return { clamped: rankToLevel(ceilingRank), wasClamped: true };
-}
-
-/** Checks if a config string is empty, null, or contains only exclamation marks/whitespace */
 function isInvalidConfig(cfg?: string | null): boolean {
-  if (!cfg || typeof cfg !== 'string') return true;
-  const trimmed = cfg.trim();
-  return trimmed === '' || /^[!\s]+$/.test(trimmed);
+  return !cfg || !cfg.trim() || /^[!\s]+$/.test(cfg.trim());
 }
 
-/**
- * Calls Groq/Llama for qualitative summary and recommendations.
- */
-async function performLlmAnalysis(
-  rawConfig: string,
-  hostname: string,
-  vendor: string,
-  findings: ValidatedFinding[]
-): Promise<LlmAnalysisResult> {
-  const apiKey = process.env.GROQ_API_KEY;
+async function performLlmAnalysis(sanitizedConfig: string, hostname: string, vendor: string, findings: ValidatedFinding[]): Promise<LlmAnalysis> {
+  const truncated = sanitizedConfig.length > 12000 ? `${sanitizedConfig.slice(0, 12000)}\n...[TRUNCATED FOR LENGTH]...` : sanitizedConfig;
+  const compressed = findings.slice(0, 15).map(({ ruleId, title, severity, description }) => ({ ruleId, title, severity, description }));
 
-  if (apiKey) {
-    try {
-      const sanitized = sanitizeConfig(rawConfig);
-      const truncatedConfig = sanitized.length > 12000
-        ? sanitized.slice(0, 12000) + '\n...[TRUNCATED FOR LENGTH]...'
-        : sanitized;
+  const result = await groqJson<{ summary?: string; recommendations?: unknown; riskLevel?: string }>({
+    label: 'config',
+    system: SYSTEM_PROMPT,
+    user: `Device Context:\n- Hostname: ${hostname}\n- OS Platform: ${vendor}\n\nStatic CIS Audit Findings (${findings.length} total):\n${JSON.stringify(compressed, null, 2)}\n\n${wrapUntrustedContent('running_configuration', truncated)}`,
+    temperature: 0,
+    timeoutMs: 15000,
+  });
 
-      const compressedFindings = findings.slice(0, 15).map(f => ({
-        ruleId: f.ruleId,
-        title: f.title,
-        severity: f.severity,
-        description: f.description,
-      }));
-
-      const callGroq = (model: string) => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000);
-      return fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You are a Principal Network Security Architect. Analyze the device configuration and static CIS audit findings. Provide a concise, high-impact Executive Summary (2-3 sentences analyzing systemic risk) and 3-5 vendor-specific hardening recommendations. Return ONLY valid JSON with keys: "summary" (string), "recommendations" (string array), and "riskLevel" ("CRITICAL"|"HIGH"|"MEDIUM"|"LOW"). ' +
-                // FIX (real bug, confirmed by hand): the model recommended
-                // "removing VLAN 999 from the trunk allowed-vlan list" on a
-                // config where VLAN 999 was never in any trunk's allowed
-                // list — it only appears as the access VLAN on one shut-down
-                // port, which is the correct, standard way to park an unused
-                // port, not a finding. The model pattern-matched on "unused
-                // VLANs on trunks are bad" instead of reading the literal
-                // config it was given.
-                'Every claim and recommendation must be grounded strictly in the literal text of the running-configuration provided below — never state that a VLAN, interface, ACL, or feature appears somewhere in the config unless you can quote the exact command or interface name it appears under. Before recommending that a VLAN be removed from a trunk\'s allowed-vlan list, re-read that trunk interface\'s own "switchport trunk allowed vlan" line and confirm the VLAN number is actually present in it. If a port is administratively shut down and assigned to an otherwise-unused VLAN, that is a standard hardening pattern (a "blackhole" VLAN) — do not flag it as a gap. ' +
-                // FIX (real bug, confirmed by hand, round 2): recommendations
-                // were citing specific line numbers (e.g. "line 71-73") that
-                // did not correspond to the content being described — the
-                // model was never given a numbered version of the config, so
-                // any line number it writes is fabricated, not looked up.
-                // Quoting the exact command/interface name is checkable
-                // against the literal config text; a line number is not.
-                'You are NOT given line numbers for the configuration below, so NEVER cite or invent one (e.g. "line 71-73", "lines 31-38") in a recommendation — any such number would be fabricated, not a real lookup, and is actively misleading to the reader. When you need to point someone to a specific part of the configuration, quote the exact interface name or command text instead (e.g. "see interface Vlan99" or "the switchport trunk allowed vlan line on Port-channel1"), never a line number.',
-            },
-            {
-              role: 'user',
-              // FIX: the raw device config is attacker-influenceable data,
-              // not part of the operator's instructions. It's now wrapped
-              // in an explicit untrusted-data boundary (see lib/security.ts)
-              // instead of being concatenated straight into the prompt.
-              content: `Device Context:\n- Hostname: ${hostname}\n- OS Platform: ${vendor}\n\nStatic CIS Audit Findings (${findings.length} total):\n${JSON.stringify(compressedFindings, null, 2)}\n\n${wrapUntrustedContent('running_configuration', truncatedConfig)}`,
-            },
-          ],
-          // FIX: dropped from 0.1 to 0.0 to match analyze-firmware/route.ts's
-          // Groq call. This endpoint's output (riskLevel, CIS-adjacent
-          // findings narrative) is a classification/audit result, not
-          // creative writing — identical input (same config, same vendor,
-          // same static findings) should not flip between MEDIUM and HIGH
-          // across runs. This is vendor-agnostic: the prompt and findings
-          // payload are already built generically from whatever
-          // detectVendor() resolves, for any of the 16 supported platforms,
-          // so lowering temperature doesn't single out or change behavior
-          // for any one vendor — it just makes the model's own self-rated
-          // riskLevel more reproducible for all of them equally.
-          temperature: 0.0,
-          // FIX: same mitigation as analyze-firmware/route.ts, applied
-          // preventively here too — openai/gpt-oss-120b can exhaust its
-          // token budget on internal reasoning before writing the actual
-          // JSON answer when no max_tokens is set, which fails Groq's
-          // json_object validation with an empty generation (confirmed
-          // happening on the firmware-analysis endpoint from your
-          // terminal log; this endpoint has a shorter prompt so it's less
-          // likely to hit it, but the same risk exists).
-          ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
-          max_tokens: 2048,
-          response_format: { type: 'json_object' },
-        }),
-      }).finally(() => clearTimeout(timeoutId));
-      };
-
-      // FIX: Groq sometimes answers 503 "over capacity" / 429. That used to
-      // be ignored silently (no log) and the generic fallback text was shown.
-      // Now: main model, wait and retry, then a second model, with a log
-      // line for every failed attempt.
-      const GROQ_ATTEMPTS = ['openai/gpt-oss-120b', 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
-      let response: Response | null = null;
-      for (let i = 0; i < GROQ_ATTEMPTS.length; i++) {
-        try {
-          response = await callGroq(GROQ_ATTEMPTS[i]);
-        } catch (e) {
-          response = null;
-          console.warn(`[!] Groq config attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) failed:`, e);
-        }
-        if (response && response.ok) break;
-        if (response) {
-          const body = await response.clone().text().catch(() => '');
-          console.warn(`[!] Groq config attempt ${i + 1} (${GROQ_ATTEMPTS[i]}) returned ${response.status}: ${body.slice(0, 200)}`);
-        }
-        if (i < GROQ_ATTEMPTS.length - 1) {
-          await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
-        }
-      }
-
-      if (response && response.ok) {
-        const data = await response.json();
-        let rawContent = data.choices[0]?.message?.content || '{}';
-        rawContent = rawContent.replace(/```json/g, '').replace(/```/g, '').trim();
-
-        try {
-          const content = JSON.parse(rawContent);
-          const rawRecommendations = Array.isArray(content.recommendations) ? content.recommendations : [];
-          return {
-            summary: content.summary || 'AI Security Audit completed.',
-            recommendations: stripFabricatedLineCitations(rawRecommendations),
-            llmRiskLevel: normalizeRiskLevel(content.riskLevel),
-          };
-        } catch (parseErr) {
-          console.warn('[!] Groq response JSON parse failed, falling back:', parseErr);
-        }
-      }
-    } catch (err) {
-      console.warn('[!] Groq API call timed out or failed, using fallback qualitative analysis:', err);
-    }
+  if (result) {
+    const recs = Array.isArray(result.data.recommendations) ? result.data.recommendations.map(String) : [];
+    return {
+      summary: result.data.summary || 'AI Security Audit completed.',
+      recommendations: stripFabricatedLineCitations(recs),
+      llmRiskLevel: normalizeRiskLevel(result.data.riskLevel),
+      aiAvailable: true,
+    };
   }
-
   return {
-    summary: `The AI service was unavailable, so this summary is a generic baseline. The CIS rule findings and risk level below come from the rule engine and are still accurate.`,
+    summary: 'The AI service was unavailable, so this summary is a generic baseline. The CIS rule findings and risk level below come from the rule engine and are still accurate.',
     recommendations: [
       'Disable unencrypted management services (Telnet/HTTP) across all VRFs.',
-      'Enforce SSHv2 protocol restriction and explicit line idle session timeouts.',
-      'Verify centralized AAA/RADIUS authentication policies for administrative access.',
+      'Enforce SSHv2 and explicit idle session timeouts on every management line.',
+      'Verify centralized AAA (TACACS+/RADIUS) for administrative access.',
     ],
     llmRiskLevel: 'LOW',
+    aiAvailable: false,
   };
 }
 
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json().catch(() => ({}));
+function frameworkLine(f: ValidatedFinding): string {
+  if (!f.frameworks) return '';
+  const parts = (Object.keys(FRAMEWORK_LABELS) as Array<keyof typeof FRAMEWORK_LABELS>)
+    .filter((k) => f.frameworks![k].length)
+    .map((k) => `${FRAMEWORK_LABELS[k]} ${f.frameworks![k].join(', ')}`);
+  return parts.length ? `\n* **Compliance:** ${parts.join(' · ')}` : '';
+}
 
-    const deviceId = body.deviceId || body.device_id;
-    let scanId = body.scanId || body.scan_id;
-    let configurationId = body.configurationId || body.configuration_id;
-    let rawConfig = body.rawConfig || body.raw_config;
+function buildMarkdown(args: {
+  hostname: string;
+  vendor: string;
+  overallRisk: RiskLevel;
+  rawAiRisk: RiskLevel;
+  clamped: boolean;
+  injectionFlagged: boolean;
+  findings: ValidatedFinding[];
+  rulesEvaluated: number;
+  ai: LlmAnalysis;
+}): string {
+  const { findings } = args;
+  const violations = findings.length
+    ? findings
+        .map(
+          (f) => `**[${f.severity}] ${f.ruleId} — ${f.title}**
+* **Control:** ${f.cisControl || 'CIS Controls v8'}${frameworkLine(f)}
+* **Risk Detail:** ${f.description}${f.evidence ? `\n* **Evidence:** \`${f.evidence.replace(/`/g, "'")}\`` : ''}
+* **Remediation CLI:**
+\`\`\`cli
+${f.remediationCli}
+\`\`\``
+        )
+        .join('\n\n---\n\n')
+    : '✅ *No static CIS benchmark violations detected.*';
 
-    if (!deviceId) {
-      return NextResponse.json(
-        { success: false, error: 'Missing required field: deviceId' },
-        { status: 422 }
-      );
-    }
+  // Action items quote each finding's own vetted remediation command rather
+  // than the LLM's paraphrase (which once "fixed" disable-HTTP by enabling HTTPS).
+  const actions = findings.length
+    ? findings
+        .map((f, i) => (f.remediationCli.includes('\n') ? `**${i + 1}.** ${f.title}\n\`\`\`cli\n${f.remediationCli}\n\`\`\`` : `**${i + 1}.** ${f.title} — \`${f.remediationCli}\``))
+        .join('\n')
+    : args.ai.recommendations.map((r, i) => `**${i + 1}.** ${r}`).join('\n');
 
-    const supabase = getSupabaseAdmin();
-    let device: Record<string, any> = { hostname: 'Network-Device', vendor: 'generic' };
-
-    if (supabase) {
-      const { data: devData } = await supabase
-        .from('devices')
-        .select('*')
-        .eq('id', deviceId)
-        .maybeSingle();
-
-      if (devData) {
-        device = devData;
-
-        // Priority 1: Check device record columns
-        if (isInvalidConfig(rawConfig)) {
-          const directConfig = devData.last_config || devData.raw_config || devData.config;
-          if (!isInvalidConfig(directConfig)) {
-            rawConfig = directConfig;
-          }
-        }
-      }
-
-      // Priority 2: Check configurations table with flexible column resolution
-      if (isInvalidConfig(rawConfig)) {
-        const { data: latestConfig } = await supabase
-          .from('configurations')
-          .select('*')
-          .eq('device_id', deviceId)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (latestConfig) {
-          rawConfig = latestConfig.raw_config ||
-                     latestConfig.content ||
-                     latestConfig.config ||
-                     latestConfig.running_config ||
-                     latestConfig.configuration || '';
-          configurationId = latestConfig.id;
-        }
-      }
-
-      // FIX (schema-confirmed bug): public.scans.configuration_id is NOT
-      // NULL. configurationId only got set above when rawConfig had to be
-      // fetched FROM the configurations table (Priority 2). When rawConfig
-      // came straight from devices.last_config (Priority 1) — the normal
-      // case, since the collector writes last_config on every successful
-      // run — configurationId stayed undefined, and the insert further
-      // down silently failed the NOT NULL constraint every time. We now
-      // always resolve a configuration_id for this device if one isn't
-      // already known, independent of where rawConfig itself came from.
-      if (!configurationId) {
-        const { data: idOnlyConfig } = await supabase
-          .from('configurations')
-          .select('id')
-          .eq('device_id', deviceId)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (idOnlyConfig) {
-          configurationId = idOnlyConfig.id;
-        } else {
-          // FIX: a device whose config text was seeded directly onto
-          // devices.last_config (e.g. a demo/lab device that never went
-          // through the real SSH "Collect Telemetry" pipeline) has NO
-          // configurations row at all, for any scan, ever — so the lookup
-          // above always comes back empty and every scan for that device
-          // permanently dead-ends at "not persisted" below, regardless of
-          // how many times it's re-run. We already have real, valid config
-          // text in hand right now (`rawConfig`, validated above), so
-          // create the missing snapshot ourselves instead of only ever
-          // reading for one. This is vendor-agnostic — it runs the same way
-          // for any device on any platform, not just Cisco.
-          const { data: createdConfig } = await supabase
-            .from('configurations')
-            .insert({
-              device_id: deviceId,
-              raw_config: rawConfig,
-              created_at: new Date().toISOString(),
-            })
-            .select('id')
-            .maybeSingle();
-          if (createdConfig) {
-            configurationId = createdConfig.id;
-          }
-        }
-      }
-    }
-
-    // Validate configuration presence
-    if (isInvalidConfig(rawConfig)) {
-      return NextResponse.json(
-        { success: false, error: 'No valid device configuration available to scan. Collect telemetry first.' },
-        { status: 422 }
-      );
-    }
-
-    const sanitizedPayload = sanitizeConfig(rawConfig);
-
-    // FIX: This used to return 422 and refuse to audit the device whenever
-    // the config text matched an injection signature. That's backwards for
-    // a security tool: anyone who can write to the device's running-config
-    // (e.g. via a separate compromise) can plant a matching phrase and make
-    // this endpoint silently stop auditing that device — the exact device
-    // that most needs auditing. We now flag it (goes into the saved scan
-    // record and the response) and keep auditing. The LLM prompt itself
-    // wraps the config in an explicit untrusted-data boundary so the model
-    // is told never to treat it as instructions, which is the actual
-    // mitigation — the regex scan is a detector/alert, not a gate.
-    const injectionCheck = scanForPromptInjection(sanitizedPayload);
-
-    const detectedPlatform = body.vendor || device.netmiko_type || device.vendor || 'cisco_xe';
-    const vendorType = detectVendor(detectedPlatform);
-
-    // 1. Evaluate the RAW config deterministically. It never leaves the
-    // server here, and redaction would hide values the rules must see
-    // (e.g. a "public" SNMP community). Evidence strings come back redacted.
-    const cisResult = evaluateConfigDeterministically(rawConfig, vendorType);
-    const cisFloorRisk = normalizeRiskLevel(cisResult.riskLevel);
-    const validatedFindings = cisResult.findings;
-
-    // 2. Fetch qualitative executive summary & recommendations from LLM
-    const aiAnalysis = await performLlmAnalysis(sanitizedPayload, device.hostname, vendorType, validatedFindings);
-
-    // 3. Enforce Hybrid Risk Calculation: deterministic floor, then clamp
-    // the AI's own self-rating so it can't inflate the result unchecked
-    // (see clampAiRiskToFloor above).
-    const rawAiRiskLevel = aiAnalysis.llmRiskLevel || 'LOW';
-    const { clamped: clampedAiRiskLevel, wasClamped: riskWasClamped } = clampAiRiskToFloor(
-      rawAiRiskLevel,
-      cisFloorRisk
-    );
-    if (riskWasClamped) {
-      console.warn(
-        `[!] AI self-rated risk (${rawAiRiskLevel}) exceeded the deterministic floor (${cisFloorRisk}) by more than one level for device ${deviceId}; clamped to ${clampedAiRiskLevel}.`
-      );
-    }
-    const overallRisk = getHighestRiskLevel(cisFloorRisk, clampedAiRiskLevel);
-    const riskBadge = overallRisk === 'CRITICAL' ? '🔴 CRITICAL' : overallRisk === 'HIGH' ? '🟠 HIGH' : overallRisk === 'MEDIUM' ? '🟡 MEDIUM' : '🟢 LOW';
-
-    const formattedMarkdownSummary =
-`### 🛡️ Device Assessment Overview
-* **Hostname:** ${device.hostname}
-* **OS / Vendor:** \`${vendorType}\`
-* **Static Findings:** ${validatedFindings.length} Benchmark Rules Violated
-* **Overall Risk Rating:** ${riskBadge}${riskWasClamped ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device as **${rawAiRiskLevel}**, which was more than one level above what the static findings justify. The displayed rating was capped to **${overallRisk}**, the highest level the static evidence currently supports.` : ''}${injectionCheck.flagged ? '\n* **⚠️ Integrity Alert:** This configuration contains text matching prompt-injection signatures. It was still fully audited below; treat this device as a priority for manual review, since the match itself can indicate tampering.' : ''}
+  return `### 🛡️ Device Assessment Overview
+* **Hostname:** ${args.hostname}
+* **OS / Vendor:** \`${args.vendor}\`
+* **Static Findings:** ${findings.length} of ${args.rulesEvaluated} applicable rules violated
+* **Overall Risk Rating:** ${riskBadge(args.overallRisk)}${
+    args.clamped
+      ? `\n* **⚠️ AI Rating Overridden:** The AI self-rated this device **${args.rawAiRisk}**, more than the static findings justify. The rating was capped at **${args.overallRisk}**.`
+      : ''
+  }${
+    args.injectionFlagged
+      ? '\n* **⚠️ Integrity Alert:** This configuration contains text matching prompt-injection signatures. It was still fully audited; review this device manually, since the match itself can indicate tampering.'
+      : ''
+  }
 
 ---
 
 ### 📋 Executive Security Summary
-> ${aiAnalysis.summary || 'Configuration assessment complete.'}
+> ${args.ai.summary || 'Configuration assessment complete.'}
 
 ---
 
-### 🚨 CIS Benchmark Violations (${validatedFindings.length})
+### 🚨 CIS Benchmark Violations (${findings.length})
 
-${validatedFindings.length > 0
-  ? validatedFindings.map((f: ValidatedFinding) =>
-`**[${f.severity}] ${f.ruleId} — ${f.title}**
-* **Framework Mapping:** ${f.cisControl || 'CIS Control Baseline'}
-* **Risk Detail:** ${f.description}
-* **Remediation CLI:**
-\`\`\`cli
-${f.remediationCli}
-\`\`\``).join('\n\n---\n\n')
-  : '✅ *No static CIS benchmark violations detected.*'}
+${violations}
 
 ---
 
 ### 💡 Hardening Action Items
-${
-  // FIX: this section used to render aiAnalysis.recommendations — the
-  // LLM's own free-text paraphrase of what to do about each finding. That's
-  // exactly where a real mismatch was found: for a CIS-1.4 (disable HTTP)
-  // finding, the CIS Benchmark Violations section above correctly shows
-  // `set deviceconfig system service disable-http yes`, but the LLM's own
-  // restated version of the same fix here said `set network interface
-  // management https-enable yes` — a command that enables HTTPS, not one
-  // that disables HTTP. The AI wasn't lying about the config; it just
-  // mis-recalled the exact syntax when re-explaining a fix in its own
-  // words instead of quoting the already-verified command.
-  //
-  // Each `validatedFinding` already carries its own exact, correct
-  // `remediationCli` (built deterministically per-vendor by
-  // evaluateConfigDeterministically(), not by the LLM) — the same string
-  // shown in the section above. Reusing it here instead of the LLM's prose
-  // makes this class of mismatch structurally impossible: both sections
-  // now read from the identical source, for any of the 19 platforms in
-  // collector.py's VENDOR_COMMAND_MAP, not just Cisco.
-  //
-  // A config with zero deterministic findings has nothing to quote, so
-  // that case alone still falls back to the AI's own general recommendations.
-  validatedFindings.length > 0
-    ? validatedFindings
-        // Multi-line commands (e.g. "line vty 0 15" + "exec-timeout 10 0")
-        // used to be squeezed into one inline-code span, which broke the
-        // layout. They now go in a proper code block (copyable, keeps the
-        // line breaks); single-line commands stay inline.
-        .map((f: ValidatedFinding, idx: number) =>
-          f.remediationCli.includes('\n')
-            ? `**${idx + 1}.** ${f.title}\n\`\`\`cli\n${f.remediationCli}\n\`\`\``
-            : `**${idx + 1}.** ${f.title} — \`${f.remediationCli}\``
-        )
-        .join('\n')
-    : aiAnalysis.recommendations.map((r: string, idx: number) => `**${idx + 1}.** ${r}`).join('\n')
-}`;
+${actions}`;
+}
 
-    // FIX (schema-confirmed bug): public.scans has no `findings` column at
-    // all — that key was silently rejected by every insert/update below
-    // (caught by the try/catch, logged as non-fatal), so no finding from
-    // any scan was ever actually persisted. Reloading the dashboard, or
-    // opening a device the next day, only ever showed risk_level and the
-    // markdown summary — the specific findings existed only in that one API
-    // response and the client's in-memory cache. The schema already has a
-    // `vulnerabilities` table built for exactly this (scan_id, title,
-    // severity, description, remediation_cli) and useDashboard.ts already
-    // reads from it — nothing ever wrote to it. That's fixed below.
-    //
-    // FIX: `configuration_id: configurationId || null` — scans.configuration_id
-    // is NOT NULL, so this insert silently failed the constraint whenever
-    // configurationId wasn't resolved (see the fix above). It's now guarded:
-    // no configurationId means we skip the scans write entirely rather than
-    // attempting (and losing) an insert the database will always reject.
-    let savedScanId = scanId || null;
-    let dbPersisted = false;
-    let dbWarning: string | null = null;
+export async function POST(req: NextRequest) {
+  try {
+    const ctx = await requireUser(req, 'operator');
+    const body = ScanBody.parse(await readJson(req));
+    enforceRateLimit(ctx.userId, 'ai-scan', 20);
+    const device = await requireDevice(ctx, body.deviceId, 'operator');
+    const admin = ctx.admin;
 
-    if (supabase) {
-      try {
-        const nowIso = new Date().toISOString();
-
-        if (scanId) {
-          await supabase
-            .from('scans')
-            .update({
-              status: 'completed',
-              risk_level: overallRisk,
-              summary: formattedMarkdownSummary,
-              updated_at: nowIso,
-            })
-            .eq('id', scanId);
-          dbPersisted = true;
-        } else if (configurationId) {
-          const { data: inserted } = await supabase
-            .from('scans')
-            .insert({
-              device_id: deviceId,
-              configuration_id: configurationId,
-              status: 'completed',
-              risk_level: overallRisk,
-              summary: formattedMarkdownSummary,
-              created_at: nowIso,
-              updated_at: nowIso,
-            })
-            .select('id')
-            .maybeSingle();
-          if (inserted) {
-            savedScanId = inserted.id;
-            dbPersisted = true;
-          }
-        } else {
-          dbWarning = 'No configuration snapshot exists for this device (scans.configuration_id is required), so this scan result could not be saved to history. It is still shown below for this response only.';
-          console.warn(`[!] Scan for ${deviceId} not persisted: no configuration_id available.`);
-        }
-
-        // Persist findings into the vulnerabilities table (scans has no
-        // findings column — see fix note above). On an update, clear this
-        // scan's previous findings first so re-scanning doesn't accumulate
-        // duplicates.
-        if (savedScanId && validatedFindings.length > 0) {
-          if (scanId) {
-            await supabase.from('vulnerabilities').delete().eq('scan_id', savedScanId);
-          }
-          const severityTitleCase = (level: string): string => {
-            const normalized = (level || '').toUpperCase();
-            const map: Record<string, string> = {
-              CRITICAL: 'Critical', HIGH: 'High', MEDIUM: 'Medium', LOW: 'Low',
-              INFORMATIONAL: 'Informational', SAFE: 'Safe',
-            };
-            // vulnerabilities.severity has a CHECK constraint on this exact
-            // set of Title Case values; the CIS engine emits UPPERCASE.
-            return map[normalized] || 'Informational';
-          };
-          const vulnRows = validatedFindings.map((f: any) => ({
-            scan_id: savedScanId,
-            title: f.title || f.ruleId || 'Untitled finding',
-            severity: severityTitleCase(f.severity),
-            description: f.description || null,
-            affected_config_line: f.affectedConfigLine || f.affected_config_line || null,
-            remediation_cli: f.remediationCli || f.remediation_cli || null,
-          }));
-          const { error: vulnErr } = await supabase.from('vulnerabilities').insert(vulnRows);
-          if (vulnErr) {
-            console.warn('[!] Non-fatal error writing vulnerabilities:', vulnErr);
-          }
-        }
-
-        // Update device risk level and ensure last_config stays populated
-        try {
-          await supabase
-            .from('devices')
-            .update({
-              risk_level: overallRisk,
-              last_config: rawConfig,
-            })
-            .eq('id', deviceId);
-        } catch (devErr) {
-          console.warn('[!] Non-fatal error updating device record:', devErr);
-        }
-
-      } catch (dbErr) {
-        console.warn('[!] Scan DB record write error:', dbErr);
-        dbWarning = 'Scan completed but could not be fully saved to the database.';
+    // Config source, most explicit first: request body, devices row, latest snapshot.
+    let rawConfig = body.rawConfig;
+    let configurationId = body.configurationId ?? null;
+    if (isInvalidConfig(rawConfig) && !isInvalidConfig(device.last_config)) rawConfig = device.last_config;
+    if (isInvalidConfig(rawConfig) || !configurationId) {
+      const { data: latest } = await admin
+        .from('configurations')
+        .select('id, raw_config, content')
+        .eq('device_id', device.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latest) {
+        if (isInvalidConfig(rawConfig)) rawConfig = latest.raw_config || latest.content || '';
+        configurationId = configurationId || latest.id;
       }
     }
+    if (isInvalidConfig(rawConfig)) throw new HttpError(422, 'No valid device configuration available to scan. Collect telemetry first.');
+    const config = rawConfig as string;
+
+    // scans.configuration_id is NOT NULL: create a snapshot for devices whose
+    // config was seeded directly onto devices.last_config.
+    if (!configurationId) {
+      const { data: created } = await admin
+        .from('configurations')
+        .insert({ device_id: device.id, raw_config: config, source: 'manual' })
+        .select('id')
+        .single();
+      configurationId = created?.id ?? null;
+    }
+
+    const sanitized = sanitizeConfig(config);
+    // A detector, not a gate: refusing to audit on a match would let anyone
+    // who can write to the config switch auditing off for that device.
+    const injection = scanForPromptInjection(sanitized);
+
+    const vendorType = detectVendor(body.vendor || device.netmiko_type || device.vendor || 'cisco_xe');
+    // Rules run on the raw config server-side; evidence comes back redacted.
+    const cis = evaluateConfigDeterministically(config, vendorType);
+    const floor = normalizeRiskLevel(cis.riskLevel);
+    const ai = await performLlmAnalysis(sanitized, device.hostname, vendorType, cis.findings);
+    const { clamped, wasClamped } = clampAiRiskToFloor(ai.llmRiskLevel, floor);
+    if (wasClamped) console.warn(`[!] AI risk ${ai.llmRiskLevel} clamped to ${clamped} (floor ${floor}) for ${device.id}`);
+    const overallRisk = getHighestRiskLevel(floor, clamped);
+
+    const summary = buildMarkdown({
+      hostname: device.hostname,
+      vendor: vendorType,
+      overallRisk,
+      rawAiRisk: ai.llmRiskLevel,
+      clamped: wasClamped,
+      injectionFlagged: injection.flagged,
+      findings: cis.findings,
+      rulesEvaluated: cis.rulesEvaluated,
+      ai,
+    });
+
+    let savedScanId = body.scanId ?? null;
+    let dbWarning: string | null = null;
+    const now = new Date().toISOString();
+    if (savedScanId) {
+      const { error } = await admin
+        .from('scans')
+        .update({ status: 'completed', risk_level: overallRisk, summary, rules_evaluated: cis.rulesEvaluated, updated_at: now })
+        .eq('id', savedScanId)
+        .eq('device_id', device.id);
+      if (error) dbWarning = `Scan could not be saved: ${error.message}`;
+    } else if (configurationId) {
+      const { data: inserted, error } = await admin
+        .from('scans')
+        .insert({
+          device_id: device.id,
+          configuration_id: configurationId,
+          status: 'completed',
+          risk_level: overallRisk,
+          summary,
+          rules_evaluated: cis.rulesEvaluated,
+          model_used: ai.aiAvailable ? 'cis-rules + groq' : 'cis-rules',
+          created_at: now,
+          updated_at: now,
+        })
+        .select('id')
+        .single();
+      if (error) dbWarning = `Scan could not be saved: ${error.message}`;
+      savedScanId = inserted?.id ?? null;
+    }
+
+    if (savedScanId) {
+      await admin.from('vulnerabilities').delete().eq('scan_id', savedScanId);
+      if (cis.findings.length) {
+        const { error } = await admin.from('vulnerabilities').insert(
+          cis.findings.map((f) => ({
+            scan_id: savedScanId,
+            rule_id: f.ruleId,
+            title: f.title,
+            severity: severityTitleCase(f.severity),
+            description: f.description,
+            evidence: f.evidence ?? null,
+            frameworks: f.frameworks ?? null,
+            remediation_cli: f.remediationCli,
+          }))
+        );
+        if (error) console.warn('[!] vulnerabilities insert failed:', error.message);
+      }
+    }
+
+    await admin.from('devices').update({ risk_level: overallRisk, last_config: config }).eq('id', device.id);
+    await recordRisk(admin, {
+      deviceId: device.id,
+      riskLevel: overallRisk,
+      source: 'config',
+      findingsCount: cis.findings.length,
+      rulesEvaluated: cis.rulesEvaluated,
+    });
+    await audit(ctx, { action: 'scan.config', orgId: device.org_id, targetType: 'device', targetId: device.id, details: { riskLevel: overallRisk, findings: cis.findings.length } });
 
     return NextResponse.json({
       success: true,
       scanId: savedScanId,
-      deviceId,
+      deviceId: device.id,
       riskLevel: overallRisk,
-      summary: formattedMarkdownSummary,
-      output: formattedMarkdownSummary,
-      sanitizedConfig: sanitizedPayload,
-      findings: validatedFindings,
-      // FIX: surfaced instead of silently gating the whole scan (see note above)
-      promptInjectionFlagged: injectionCheck.flagged,
-      promptInjectionMatches: (injectionCheck as any).matchedSignatures ?? injectionCheck.matches ?? [],
-      dbPersisted,
+      summary,
+      output: summary,
+      findings: cis.findings,
+      rulesEvaluated: cis.rulesEvaluated,
+      promptInjectionFlagged: injection.flagged,
+      promptInjectionMatches: injection.matches ?? [],
+      dbPersisted: !!savedScanId && !dbWarning,
       dbWarning,
       aiAnalysis: {
         riskLevel: overallRisk,
-        // FIX: surfaced so the UI (and you, in a viva) can show exactly
-        // what the AI said on its own vs. what was actually displayed,
-        // instead of the clamp being an invisible server-side detail.
-        rawAiRiskLevel,
-        cisFloorRisk,
-        riskWasClamped,
-        summary: aiAnalysis.summary,
-        recommendations: aiAnalysis.recommendations,
-        rawFindings: validatedFindings,
+        rawAiRiskLevel: ai.llmRiskLevel,
+        cisFloorRisk: floor,
+        riskWasClamped: wasClamped,
+        aiAvailable: ai.aiAvailable,
+        summary: ai.summary,
+        recommendations: ai.recommendations,
       },
     });
-  } catch (err: any) {
-    console.error('[-] Error executing scan in /api/scan:', err);
-    return NextResponse.json(
-      { success: false, error: err?.message || 'Internal Server Error' },
-      { status: 500 }
-    );
+  } catch (err) {
+    return routeError(err, 'POST /api/scan');
   }
 }
