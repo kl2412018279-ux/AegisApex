@@ -39,8 +39,11 @@ if not exist .venv\Scripts\python.exe (
   python -m venv .venv
   if errorlevel 1 goto failed
 )
-echo Installing / checking requirements...
-.venv\Scripts\python.exe -m pip install --disable-pip-version-check -q -r requirements.txt
+for /f "delims=" %%v in ('.venv\Scripts\python.exe --version') do echo Using %%v
+echo Updating pip...
+.venv\Scripts\python.exe -m pip install --disable-pip-version-check -q --upgrade pip
+echo Installing / checking requirements (this can take several minutes on a slow connection)...
+.venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto failed
 
 echo.
