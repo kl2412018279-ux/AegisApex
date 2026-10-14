@@ -46,6 +46,14 @@ on conflict (id) do nothing;
 -- ─── Columns on existing tables ────────────────────────────────────────────
 
 alter table public.devices add column if not exists org_id uuid references public.organizations(id);
+-- Columns the dashboard selects explicitly (it can't use select('*') once
+-- credential columns are hidden). No-ops on databases that already have them.
+alter table public.devices add column if not exists ip_address text;
+alter table public.devices add column if not exists management_ip text;
+alter table public.devices add column if not exists os_version text;
+alter table public.devices add column if not exists raw_version text;
+alter table public.devices add column if not exists last_config text;
+alter table public.devices add column if not exists last_seen_at timestamptz;
 alter table public.devices add column if not exists is_mock boolean not null default false;
 alter table public.devices add column if not exists ssh_port integer;
 alter table public.devices add column if not exists ssh_host_key_type text;

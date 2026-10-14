@@ -19,6 +19,12 @@ begin
   if n <> 1 then raise exception 'admin should see 1 device, saw %', n; end if;
   select count(*) into n from public.agent_jobs;
   if n <> 1 then raise exception 'admin should see 1 job, saw %', n; end if;
+  -- the dashboard's explicit column list (dashboard/_hooks/dashboardData.ts) is readable
+  perform id, hostname, ip_address, management_ip, vendor, netmiko_type, connection_status, last_seen_at,
+          created_at, risk_level, last_config, raw_version, os_version, org_id, is_mock,
+          collection_interval_minutes, next_collection_at, last_collection_error,
+          ssh_host_key_fingerprint, ssh_host_key_pinned_at
+     from public.devices;
   -- credential column is not readable
   begin
     perform ssh_pass from public.devices;

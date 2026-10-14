@@ -16,6 +16,9 @@ const CASES: Array<[string, string, string]> = [
   ['snmp_community_strings', 'snmp-server community s3cr3tRW RW', 's3cr3tRW'],
   ['radius_tacacs_keys', 'tacacs-server host 10.0.0.5 key 0 TacKey99', 'TacKey99'],
   ['ipsec_ike_psk', 'crypto isakmp key IkeSecret1 address 0.0.0.0', 'IkeSecret1'],
+  ['ntp_authentication_keys', 'ntp authentication-key 1 md5 0822455D0A16 7', '0822455D0A16'],
+  ['routing_protocol_keys', ' ip ospf message-digest-key 1 md5 OspfKey9', 'OspfKey9'],
+  ['routing_protocol_keys (junos)', 'set protocols ospf area 0 interface ge-0/0/0 authentication md5 1 key "$9$abc"', '$9$abc'],
   ['ssh_private_keys', '-----BEGIN RSA PRIVATE KEY-----\nMIIEsecretbody\n-----END RSA PRIVATE KEY-----', 'MIIEsecretbody'],
   ['generic_credential_fallback', 'set system login user ops authentication plaintext-password Plain123\nauth-password VyosSecret', 'VyosSecret'],
 ];

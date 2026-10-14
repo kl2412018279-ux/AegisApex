@@ -47,8 +47,8 @@
     },
     {
       "id": "juniper_9_encrypted",
-      "description": "Juniper $9$ encrypted secret credentials (quoted or unquoted)",
-      "regex": "(encrypted-password|secret)\\s+([\"']?)(\\$9\\$[^\"'\\s]+)([\"']?)",
+      "description": "Juniper $9$ encrypted secrets and keys (quoted or unquoted), incl. routing-protocol and NTP keys",
+      "regex": "(encrypted-password|secret|key)\\s+([\"']?)(\\$9\\$[^\"'\\s]+)([\"']?)",
       "flags": "gi",
       "mode": "quoted",
       "tokenCategory": "JUNIPER_HASH",
@@ -163,6 +163,30 @@
       "flags": "gi",
       "mode": "group",
       "tokenCategory": "IPSEC_PSK",
+      "secretGroup": 2,
+      "prefixGroups": [
+        1
+      ]
+    },
+    {
+      "id": "ntp_authentication_keys",
+      "description": "NTP symmetric authentication keys (Cisco/Arista/Dell: ntp authentication-key N md5|sha1 KEY)",
+      "regex": "(ntp\\s+authentication-key\\s+\\d+\\s+(?:md5|sha1|sha256|hmac-sha\\d*|cmac-aes)\\s+)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "NTP_KEY",
+      "secretGroup": 2,
+      "prefixGroups": [
+        1
+      ]
+    },
+    {
+      "id": "routing_protocol_keys",
+      "description": "OSPF / IS-IS / RIP / EIGRP / BGP authentication keys (message-digest-key, authentication-key, key chain key-string variants)",
+      "regex": "((?:message-digest-key\\s+\\d+\\s+md5|authentication-key|authentication\\s+key)\\s+(?:\\d\\s+)?)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "ROUTING_KEY",
       "secretGroup": 2,
       "prefixGroups": [
         1
