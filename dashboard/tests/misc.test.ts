@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { generateSmartRollback } from '@/lib/rollback';
-import { checkRateLimit, resetRateLimits } from '@/lib/rateLimit';
+import { checkRateLimit, enforceRateLimit, resetRateLimits } from '@/lib/rateLimit';
 import { ScanBody, RiskBody, AlertChannelBody } from '@/lib/validation';
 
 describe('generateSmartRollback', () => {
@@ -27,6 +27,22 @@ describe('checkRateLimit', () => {
     expect(blocked.ok).toBe(false);
     expect(blocked.retryAfterSec).toBe(1);
     expect(checkRateLimit('k', 3, 1000, 1001).ok).toBe(true);
+  });
+});
+
+describe('enforceRateLimit', () => {
+  beforeEach(() => resetRateLimits());
+  const fakeAdmin = (rows: unknown, error: unknown = null) => ({ rpc: async () => ({ data: rows, error }) }) as any;
+
+  it('uses the shared Postgres window when available', async () => {
+    await expect(enforceRateLimit(fakeAdmin([{ allowed: true, retry_after: 0 }]), 'u', 'b', 1)).resolves.toBeUndefined();
+    await expect(enforceRateLimit(fakeAdmin([{ allowed: false, retry_after: 42 }]), 'u', 'b', 1)).rejects.toMatchObject({ status: 429, headers: { 'Retry-After': '42' } });
+  });
+
+  it('falls back to the in-memory window when the function is missing', async () => {
+    const admin = fakeAdmin(null, { message: 'function check_rate_limit does not exist' });
+    await enforceRateLimit(admin, 'u', 'b', 1);
+    await expect(enforceRateLimit(admin, 'u', 'b', 1)).rejects.toMatchObject({ status: 429 });
   });
 });
 

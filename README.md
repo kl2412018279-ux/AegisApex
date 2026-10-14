@@ -27,10 +27,11 @@ The dashboard never connects to devices. It queues jobs in `agent_jobs`; the age
 
 ### 1. Database
 
-Apply the migration to your Supabase project (SQL editor, or `supabase db push`):
+Apply both migrations, in order, to your Supabase project (SQL editor, or `supabase db push`):
 
 ```
 supabase/migrations/20261014120000_aegisapex_upgrades.sql
+supabase/migrations/20261015090000_rate_limits.sql
 ```
 
 Read its header first. In short:
@@ -58,7 +59,7 @@ On Vercel, `dashboard/vercel.json` schedules two cron jobs:
 - `/api/cron/process` every 5 minutes: change tracking, remediation verification and alert delivery.
 - `/api/cron/digest` on Mondays at 08:00 UTC.
 
-Set `CRON_SECRET` in Vercel. The Hobby plan only allows daily cron jobs, so on Hobby you need to call `/api/cron/process` from an external scheduler with `Authorization: Bearer $CRON_SECRET`.
+Set `CRON_SECRET` in Vercel. The Hobby plan only allows daily cron jobs. On Hobby, use `.github/workflows/cron.yml` instead: add `APP_BASE_URL` and `CRON_SECRET` as repository secrets and GitHub Actions calls the same endpoints on the same schedule.
 
 ### 3. Agent
 
@@ -73,7 +74,11 @@ docker run -d --restart unless-stopped --env-file .env aegisapex-agent
 
 To run it without Docker: `pip install -r requirements.txt && python worker.py`. To collect every device once: `python collector.py`.
 
-Device credentials stay in Supabase Vault (`get_device_credentials`). The first successful connection pins each device's SSH host key. If the key ever changes, the agent refuses to connect and raises a CRITICAL alert; an admin can reset the pin from the *Changes & Collection* tab. Set `AEGIS_REQUIRE_PINNED_HOST_KEYS=true` if you want to pin keys out of band instead.
+Device credentials stay in Supabase Vault (`get_device_credentials`). The first successful connection pins each device's SSH host key. If the key ever changes, the agent refuses to connect and raises a CRITICAL alert; an admin can reset the pin from the *Changes & Collection* tab. To avoid trusting the first connection, pin keys out of band instead:
+1. From a trusted network path, run `python agent/hostkeys.py scan <device-ip>`.
+2. Compare the fingerprint it prints with the device console.
+3. Paste the key line into *Changes & Collection → Pin a key verified out of band* (admin only).
+4. Set `AEGIS_REQUIRE_PINNED_HOST_KEYS=true` on the agent so it refuses any device without a pinned key.
 
 ### 4. Users
 
@@ -96,7 +101,7 @@ CI (`.github/workflows/ci.yml`) runs the dashboard checks, the agent tests and t
 
 ## Limitations
 
-- **Rate limiting** is held in memory per server instance. It stops a runaway loop or a single abusive session, but it is not a global quota.
 - **Compliance mappings** are indicative. They only cover what a device configuration can show and are not a formal assessment.
-- **CPE lookups** are skipped for Huawei VRP, Dell OS10, Nokia SR OS, VyOS and Aruba, because NVD's naming for them is inconsistent. Those platforms rely on NVD-verified AI suggestions.
-- **Host key pinning** is trust-on-first-use. The first connection has to happen over a network path you trust.
+- **CPE names for Huawei, Dell OS10, Nokia SR OS, VyOS and Aruba/Comware** are discovered at runtime: the dashboard tries a short list of candidate names against NVD's CPE dictionary. If NVD has no entry for that exact version, the firmware report says so and relies on NVD-verified AI suggestions.
+- **Host key pinning** trusts the first connection unless you pin keys out of band (see *Agent* above) and set `AEGIS_REQUIRE_PINNED_HOST_KEYS=true`.
+- **Rate limits** fall back to per-instance memory until the second migration is applied.

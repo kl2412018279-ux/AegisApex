@@ -8,6 +8,7 @@ DB=aegis_migration_test
 psql -q -c "drop database if exists $DB" -c "create database $DB" postgres
 run() { PGOPTIONS='-c client_min_messages=warning' psql -q -v ON_ERROR_STOP=1 -d "$DB" -f "$1"; }
 run tests/supabase_shim.sql
-run migrations/20261014120000_aegisapex_upgrades.sql
-run migrations/20261014120000_aegisapex_upgrades.sql
+for pass in 1 2; do
+  for m in migrations/*.sql; do run "$m"; done
+done
 run tests/rls_check.sql

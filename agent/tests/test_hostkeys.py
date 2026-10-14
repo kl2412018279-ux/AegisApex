@@ -66,3 +66,11 @@ def test_describes_mismatch(key):
     exc = paramiko.BadHostKeyException("10.0.0.1", paramiko.RSAKey.generate(1024), key)
     assert "does not match the pinned key" in hostkeys.describe_failure(exc)
     assert hostkeys.describe_failure(TimeoutError("timed out")) is None
+
+
+def test_scan_line_format(monkeypatch, key):
+    monkeypatch.setattr(hostkeys, "fetch_host_key", lambda h, p: key)
+    out = hostkeys.scan_line("10.0.0.1", 2222)
+    first, second = out.splitlines()
+    assert first == f"[10.0.0.1]:2222 ssh-rsa {key.get_base64()}"
+    assert second == f"# fingerprint {hostkeys.fingerprint_sha256(key.asbytes())}"

@@ -66,7 +66,7 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await requireUser(req, 'operator');
     const body = ImpactBody.parse(await readJson(req));
-    enforceRateLimit(ctx.userId, 'ai-impact', 30);
+    await enforceRateLimit(ctx.admin, ctx.userId, 'ai-impact', 30);
 
     let vendor = body.vendor || 'Generic Network OS';
     let activeConfig = body.activeConfig || '';

@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await requireUser(req, 'operator');
     const body = FirmwareBody.parse(await readJson(req));
-    enforceRateLimit(ctx.userId, 'ai-firmware', 20);
+    await enforceRateLimit(ctx.admin, ctx.userId, 'ai-firmware', 20);
     const device = await requireDevice(ctx, body.deviceId, 'operator');
     const admin = ctx.admin;
 

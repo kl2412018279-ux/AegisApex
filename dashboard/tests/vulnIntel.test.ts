@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   parsePlatformVersion, buildCpe, stripZeroPadding, lookupVulnerabilities, firmwareRiskFloor,
-  resetKevCache, verifyAiCandidates, type CveRecord,
+  resetKevCache, verifyAiCandidates, resolvePlatformCpe, resetCpeResolutionCache, type CveRecord,
 } from '@/lib/vulnIntel';
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -43,8 +43,21 @@ describe('parsePlatformVersion', () => {
     expect(buildCpe(parsed!)).toBe(cpe);
   });
 
-  it('returns null for platforms with unreliable CPE naming', () => {
+  it('returns null when the version text has no parsable version', () => {
     expect(parsePlatformVersion('huawei', 'VRP (R) software, Version 8.180')).toBeNull();
+  });
+
+  it.each([
+    ['huawei', 'VRP (R) software, Version 8.180 (CE6800 V200R005C10SPC607B607)', 'huawei', 'ce6800_firmware', 'v200r005c10'],
+    ['dell_os10', 'Dell EMC Networking OS10 Enterprise\nOS Version: 10.5.4.3', 'dell', 'emc_networking_os10', '10.5.4.3'],
+    ['nokia_sros', 'TiMOS-C-22.10.R2 cpm/hops64 Nokia 7750 SR', 'nokia', 'sr_os', '22.10.r2'],
+    ['vyos', 'Version:          VyOS 1.4.0', 'vyos', 'vyos', '1.4.0'],
+    ['aruba_hpe', 'ArubaOS-CX\nVersion      : FL.10.10.1010', 'arubanetworks', 'arubaos-cx', '10.10.1010'],
+    ['aruba_hpe', 'HPE Comware Platform Software\nComware Software, Version 7.1.070, Release 3208P08', 'hp', 'comware', '7.1.070'],
+  ] as const)('%s with candidate names (%s)', (vendor, text, cpeVendor, cpeProduct, version) => {
+    const p = parsePlatformVersion(vendor, text);
+    expect(p).toMatchObject({ cpeVendor, cpeProduct, version });
+    expect(p!.alternatives).toBeDefined();
   });
 
   it('strips zero padding', () => {
@@ -96,6 +109,34 @@ describe('lookupVulnerabilities', () => {
     const result = await lookupVulnerabilities('cisco_ios', 'Cisco IOS XE Software, Version 17.09.05', [], impl);
     expect(result.cves).toHaveLength(1);
     expect(result.errors.join(' ')).toMatch(/KEV.*503/);
+  });
+});
+
+describe('resolvePlatformCpe', () => {
+  beforeEach(() => resetCpeResolutionCache());
+
+  it('uses the first candidate the NVD CPE dictionary knows, and caches it', async () => {
+    const p = parsePlatformVersion('dell_os10', 'OS Version: 10.5.4.3')!;
+    const { impl, calls } = fakeFetch({
+      'emc_networking_os10': () => json({ totalResults: 0, products: [] }),
+      'networking_os10': () => json({ totalResults: 3, products: [{}] }),
+    });
+    expect(await resolvePlatformCpe(p, impl)).toBe('cpe:2.3:o:dell:networking_os10:10.5.4.3:*');
+    expect(await resolvePlatformCpe(p, impl)).toBe('cpe:2.3:o:dell:networking_os10:10.5.4.3:*');
+    expect(calls).toHaveLength(2);
+  });
+
+  it('returns null when no candidate exists, and lookup says why', async () => {
+    const { impl } = fakeFetch({ 'cpes/2.0': () => json({ totalResults: 0 }) });
+    const result = await lookupVulnerabilities('vyos', 'Version: VyOS 1.4.0', [], impl);
+    expect(result.cpe).toBeNull();
+    expect(result.errors.join(' ')).toMatch(/no entry for VyOS 1\.4\.0/);
+  });
+
+  it('makes no dictionary request for platforms with one well-known name', async () => {
+    const { impl, calls } = fakeFetch({});
+    expect(await resolvePlatformCpe(parsePlatformVersion('juniper', 'Junos: 21.4R3-S5')!, impl)).toBe('cpe:2.3:o:juniper:junos:21.4:r3-s5');
+    expect(calls).toHaveLength(0);
   });
 });
 

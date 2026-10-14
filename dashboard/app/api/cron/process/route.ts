@@ -18,7 +18,8 @@ export async function GET(req: NextRequest) {
     const configurationsDiffed = await processNewConfigurations(admin);
     const remediationsVerified = await verifyAppliedRemediations(admin);
     const alerts = await dispatchPendingAlerts(admin);
-    return NextResponse.json({ success: true, configurationsDiffed, remediationsVerified, alerts });
+    const { data: rateLimitRowsPruned } = await admin.rpc('prune_rate_limit_hits');
+    return NextResponse.json({ success: true, configurationsDiffed, remediationsVerified, alerts, rateLimitRowsPruned: rateLimitRowsPruned ?? null });
   } catch (err) {
     return routeError(err, 'GET /api/cron/process');
   }

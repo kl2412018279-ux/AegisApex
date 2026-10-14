@@ -5,6 +5,7 @@ import { requireUser, requireDevice, roleAtLeast, roleInOrg } from '@/lib/auth';
 import { audit } from '@/lib/audit';
 import { DeviceSettingsBody } from '@/lib/validation';
 import { readJson, routeError, HttpError } from '@/lib/http';
+import { parseHostKey } from '@/lib/hostKeys';
 
 export async function POST(req: NextRequest) {
   try {
@@ -23,6 +24,21 @@ export async function POST(req: NextRequest) {
       if (!roleAtLeast(roleInOrg(ctx, device.org_id), 'admin')) throw new HttpError(403, 'Only an admin can reset a pinned SSH host key.');
       Object.assign(update, { ssh_host_key: null, ssh_host_key_type: null, ssh_host_key_fingerprint: null, ssh_host_key_pinned_at: null });
     }
+    let pinned: ReturnType<typeof parseHostKey> | null = null;
+    if (body.pinHostKey) {
+      if (!roleAtLeast(roleInOrg(ctx, device.org_id), 'admin')) throw new HttpError(403, 'Only an admin can pin an SSH host key.');
+      try {
+        pinned = parseHostKey(body.pinHostKey);
+      } catch (e) {
+        throw new HttpError(400, `Invalid host key: ${e instanceof Error ? e.message : e}`);
+      }
+      Object.assign(update, {
+        ssh_host_key_type: pinned.type,
+        ssh_host_key: pinned.key,
+        ssh_host_key_fingerprint: pinned.fingerprint,
+        ssh_host_key_pinned_at: new Date().toISOString(),
+      });
+    }
     if (!Object.keys(update).length) throw new HttpError(400, 'Nothing to update.');
 
     const { data, error } = await ctx.admin
@@ -34,11 +50,17 @@ export async function POST(req: NextRequest) {
     if (error) throw error;
 
     await audit(ctx, {
-      action: body.resetHostKey ? 'device.host_key_reset' : 'device.settings',
+      action: pinned ? 'device.host_key_pin' : body.resetHostKey ? 'device.host_key_reset' : 'device.settings',
       orgId: device.org_id,
       targetType: 'device',
       targetId: device.id,
-      details: { ...body, previousFingerprint: body.resetHostKey ? device.ssh_host_key_fingerprint : undefined },
+      details: {
+        collectionIntervalMinutes: body.collectionIntervalMinutes,
+        isMock: body.isMock,
+        resetHostKey: body.resetHostKey,
+        pinnedFingerprint: pinned?.fingerprint,
+        previousFingerprint: body.resetHostKey || pinned ? device.ssh_host_key_fingerprint : undefined,
+      },
     });
     return NextResponse.json({ success: true, device: data });
   } catch (err) {

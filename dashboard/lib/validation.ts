@@ -81,4 +81,6 @@ export const DeviceSettingsBody = body({
   collectionIntervalMinutes: z.number().int().min(5).max(10_080).optional(),
   isMock: z.boolean().optional(),
   resetHostKey: z.boolean().optional(),
+  /** Public host key verified out of band, e.g. a line of ssh-keyscan output. */
+  pinHostKey: z.string().min(20).max(4000).optional(),
 });

@@ -116,3 +116,25 @@ def describe_failure(exc: BaseException) -> Optional[str]:
             "the pinned key from the dashboard (admin only)."
         )
     return None
+
+
+def scan_line(host: str, port: int = 22) -> str:
+    """One known_hosts-style line plus fingerprint, for out-of-band verification."""
+    key = fetch_host_key(host, port)
+    return f"{known_hosts_entry(host, port, key.get_name(), key.get_base64()).strip()}\n# fingerprint {fingerprint_sha256(key.asbytes())}"
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Print a device's SSH host key and fingerprint. Run it from a trusted network path, "
+        "compare the fingerprint with the device console (e.g. 'show crypto key mypubkey rsa' / "
+        "'show ssh server host-keys'), then paste the key line into the dashboard to pin it."
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    scan = sub.add_parser("scan")
+    scan.add_argument("host")
+    scan.add_argument("--port", type=int, default=22)
+    args = parser.parse_args()
+    print(scan_line(args.host, args.port))

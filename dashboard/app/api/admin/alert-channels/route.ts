@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
     const ctx = await requireUser(req, 'admin');
     const testId = req.nextUrl.searchParams.get('test');
     if (testId) {
-      enforceRateLimit(ctx.userId, 'alert-test', 5);
+      await enforceRateLimit(ctx.admin, ctx.userId, 'alert-test', 5);
       const channel = await loadOwned(ctx, IdQuery.parse({ id: testId }).id);
       await sendToChannel(channel, { kind: 'test', severity: 'LOW', title: 'AegisApex test alert', body: `Sent by ${ctx.email ?? ctx.userId}. If you can read this, the channel works.`, device_id: null, created_at: new Date().toISOString() });
       return NextResponse.json({ success: true });

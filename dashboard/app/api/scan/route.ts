@@ -159,7 +159,7 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await requireUser(req, 'operator');
     const body = ScanBody.parse(await readJson(req));
-    enforceRateLimit(ctx.userId, 'ai-scan', 20);
+    await enforceRateLimit(ctx.admin, ctx.userId, 'ai-scan', 20);
     const device = await requireDevice(ctx, body.deviceId, 'operator');
     const admin = ctx.admin;
 

@@ -14,6 +14,7 @@ import type { VendorType } from './cisBenchmarks';
 import type { RiskLevel } from './risk';
 
 const NVD_API = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
+const NVD_CPE_API = 'https://services.nvd.nist.gov/rest/json/cpes/2.0';
 const KEV_FEED = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json';
 const EPSS_API = 'https://api.first.org/data/v1/epss';
 
@@ -40,6 +41,12 @@ export interface ParsedPlatform {
   version: string;
   update: string | null;
   label: string;
+  /**
+   * Set for platforms whose NVD naming varies: other vendor/product names to
+   * try, in order, if the primary one isn't in the NVD CPE dictionary.
+   * Resolved at lookup time by resolvePlatformCpe().
+   */
+  alternatives?: Array<[vendor: string, product: string]>;
 }
 
 export interface VulnLookupResult {
@@ -111,12 +118,48 @@ export function parsePlatformVersion(vendor: VendorType, rawVersion: string): Pa
       const v = m(/Version\s+([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)/i);
       return v ? { part: 'a', cpeVendor: 'f5', cpeProduct: 'big-ip_local_traffic_manager', version: v[1], update: null, label: 'F5 BIG-IP LTM' } : null;
     }
+    case 'huawei': {
+      // "VRP (R) software, Version 8.180 (CE6800 V200R005C10SPC607B607)"
+      const v = m(/Version\s+[\d.]+\s*\((\S+)\s+(V\d{3}R\d{3}C\d{2})/i);
+      if (!v) return null;
+      const model = v[1].toLowerCase();
+      const series = model.replace(/-.*$/, '');
+      const products = Array.from(new Set([`${model}_firmware`, `${series}_firmware`, 'vrp']));
+      return withCandidates('Huawei VRP', v[2].toLowerCase(), products.map((p) => ['huawei', p] as [string, string]));
+    }
+    case 'dell_os10': {
+      const v = m(/OS Version:\s*([0-9]+\.[0-9]+(?:\.[0-9]+)*)/i);
+      return v ? withCandidates('Dell OS10', v[1], [['dell', 'emc_networking_os10'], ['dell', 'networking_os10'], ['dell', 'os10']]) : null;
+    }
+    case 'nokia_sros': {
+      // "TiMOS-C-22.10.R2 cpm/hops64 Nokia 7750 SR"
+      const v = m(/TiMOS-[A-Z]-(\d+\.\d+)\.R(\d+)/i);
+      return v ? withCandidates('Nokia SR OS', `${v[1]}.r${v[2]}`, [['nokia', 'sr_os'], ['nokia', 'service_router_operating_system'], ['nokia', 'timos']]) : null;
+    }
+    case 'vyos': {
+      const v = m(/Version:\s*VyOS\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)/i);
+      return v ? withCandidates('VyOS', v[1], [['vyos', 'vyos']]) : null;
+    }
+    case 'aruba_hpe': {
+      if (/ArubaOS-CX|AOS-CX/i.test(text)) {
+        const v = m(/Version\s*:\s*[A-Z]{2}\.(\d+\.\d+\.\d+)/i);
+        return v ? withCandidates('ArubaOS-CX', v[1], [['arubanetworks', 'arubaos-cx'], ['hpe', 'arubaos-cx'], ['hp', 'arubaos-cx']]) : null;
+      }
+      if (/Comware/i.test(text)) {
+        const v = m(/Comware Software,\s*Version\s+([0-9]+\.[0-9]+\.[0-9]+)/i);
+        return v ? withCandidates('HPE Comware', v[1], [['hp', 'comware'], ['hpe', 'comware']]) : null;
+      }
+      const v = m(/ArubaOS[^\n]*?Version\s+([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?)/i);
+      return v ? withCandidates('ArubaOS', v[1], [['arubanetworks', 'arubaos'], ['hpe', 'arubaos']]) : null;
+    }
     default:
-      // Huawei VRP, Dell OS10, Nokia SR OS, VyOS, Aruba: NVD's CPE naming for
-      // these is too inconsistent to query reliably. They fall back to the
-      // AI-suggested, NVD-verified path only.
       return null;
   }
+}
+
+function withCandidates(label: string, version: string, candidates: Array<[string, string]>): ParsedPlatform {
+  const [[cpeVendor, cpeProduct], ...alternatives] = candidates;
+  return { part: 'o', cpeVendor, cpeProduct, version, update: null, label, alternatives };
 }
 
 /** CPE 2.3 strings escape a handful of punctuation characters inside fields. */
@@ -167,6 +210,39 @@ export function nvdToRecord(cve: NvdCve, source: CveRecord['sources'][number]): 
     epss: null,
     epssPercentile: null,
   };
+}
+
+// vendor:product:version -> resolved CPE (or null when NVD has none). Per instance.
+const cpeResolutionCache = new Map<string, string | null>();
+
+export function resetCpeResolutionCache(): void {
+  cpeResolutionCache.clear();
+}
+
+/**
+ * For platforms with several plausible NVD names, returns the first CPE the
+ * NVD CPE dictionary actually lists for this version, or null if none.
+ * Platforms with one well-known name are returned as-is (no extra request).
+ */
+export async function resolvePlatformCpe(p: ParsedPlatform, fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  if (!p.alternatives) return buildCpe(p);
+  const primary: [string, string] = [p.cpeVendor, p.cpeProduct];
+  const candidates = [primary, ...p.alternatives].slice(0, 3);
+  const cacheKey = `${candidates.map((c) => c.join(':')).join('|')}@${p.version}`;
+  if (cpeResolutionCache.has(cacheKey)) return cpeResolutionCache.get(cacheKey)!;
+
+  for (const [vendor, product] of candidates) {
+    const cpe = buildCpe({ ...p, cpeVendor: vendor, cpeProduct: product });
+    const res = await fetchWithTimeout(fetchImpl, `${NVD_CPE_API}?cpeMatchString=${encodeURIComponent(cpe.replace(/:\*$/, ''))}&resultsPerPage=1`, { headers: nvdHeaders() }, 10000);
+    if (!res.ok) throw new Error(`NVD CPE dictionary returned ${res.status}`);
+    const data = await res.json();
+    if ((data?.totalResults ?? 0) > 0) {
+      cpeResolutionCache.set(cacheKey, cpe);
+      return cpe;
+    }
+  }
+  cpeResolutionCache.set(cacheKey, null);
+  return null;
 }
 
 export async function queryNvdByCpe(cpe: string, fetchImpl: typeof fetch = fetch): Promise<CveRecord[]> {
@@ -444,7 +520,15 @@ export async function lookupVulnerabilities(
   const errors: string[] = [];
   const sourcesQueried: string[] = [];
   const platform = parsePlatformVersion(vendor, rawVersion);
-  const cpe = platform ? buildCpe(platform) : null;
+  let cpe: string | null = null;
+  if (platform) {
+    try {
+      cpe = await resolvePlatformCpe(platform, fetchImpl);
+      if (!cpe) errors.push(`NVD's CPE dictionary has no entry for ${platform.label} ${platform.version}; only NVD-verified AI suggestions were checked.`);
+    } catch (err) {
+      errors.push(`NVD CPE dictionary lookup failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 
   let cpeMatches: CveRecord[] = [];
   if (cpe) {

@@ -87,4 +87,24 @@ do $$ begin
   raise exception 'self-approval was allowed';
 exception when check_violation then null;
 end $$;
+-- global rate limit: 3 allowed, 4th refused with a retry hint, other keys unaffected
+do $$
+declare r record; i int;
+begin
+  for i in 1..3 loop
+    select * into r from public.check_rate_limit('ai-scan:u1', 3, 60);
+    if not r.allowed then raise exception 'hit % should be allowed', i; end if;
+  end loop;
+  select * into r from public.check_rate_limit('ai-scan:u1', 3, 60);
+  if r.allowed or r.retry_after < 1 then raise exception 'fourth hit should be refused with retry_after'; end if;
+  select * into r from public.check_rate_limit('ai-scan:u2', 3, 60);
+  if not r.allowed then raise exception 'other key should be allowed'; end if;
+  set local role authenticated;
+  begin
+    perform public.check_rate_limit('x', 1, 1);
+    raise exception 'authenticated could call check_rate_limit';
+  exception when insufficient_privilege then null;
+  end;
+  reset role;
+end $$;
 select 'RLS CHECKS PASSED';

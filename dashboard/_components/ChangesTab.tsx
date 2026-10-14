@@ -62,6 +62,7 @@ export function ChangesTab({ isDarkMode, device, canOperate, isAdmin, onDeviceUp
   const [to, setTo] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [manualKey, setManualKey] = useState('');
 
   const load = useCallback(
     async (fromId?: string, toId?: string) => {
@@ -87,15 +88,17 @@ export function ChangesTab({ isDarkMode, device, canOperate, isAdmin, onDeviceUp
     load();
   }, [load]);
 
-  async function saveSettings(body: Record<string, unknown>, success: string) {
-    if (!device) return;
+  async function saveSettings(body: Record<string, unknown>, success: string): Promise<boolean> {
+    if (!device) return false;
     setSaving(true);
     try {
       await api('/api/devices/settings', { method: 'POST', json: { deviceId: device.id, ...body } });
       toast.success(success);
       onDeviceUpdated();
+      return true;
     } catch (e: any) {
       toast.error('Update failed', { description: e.message });
+      return false;
     } finally {
       setSaving(false);
     }
@@ -174,7 +177,31 @@ export function ChangesTab({ isDarkMode, device, canOperate, isAdmin, onDeviceUp
               )}
             </>
           ) : (
-            <p className={`text-xs ${muted(isDarkMode)}`}>Not pinned yet. The agent pins the key on the first successful connection.</p>
+            <p className={`text-xs ${muted(isDarkMode)}`}>
+              Not pinned yet. The agent pins the key on the first successful connection unless you pin it yourself below.
+            </p>
+          )}
+          {isAdmin && (
+            <form
+              className="mt-4 space-y-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                saveSettings({ pinHostKey: manualKey }, 'Host key pinned').then((ok) => ok && setManualKey(''));
+              }}
+            >
+              <label className="block text-[11px] font-semibold" htmlFor="manual-key">Pin a key verified out of band</label>
+              <textarea
+                id="manual-key"
+                className={`${inputClass(isDarkMode)} font-mono h-16`}
+                placeholder="ssh-ed25519 AAAAC3Nz…"
+                value={manualKey}
+                onChange={(e) => setManualKey(e.target.value)}
+              />
+              <p className={`text-[10px] ${muted(isDarkMode)}`}>
+                Get it with <code>python agent/hostkeys.py scan {device.ip_address || '<ip>'}</code> from a trusted network path and compare the fingerprint with the device console before pinning.
+              </p>
+              <Button type="submit" isDarkMode={isDarkMode} disabled={saving || manualKey.trim().length < 20}>Pin key</Button>
+            </form>
           )}
         </Card>
 
