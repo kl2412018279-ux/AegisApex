@@ -107,4 +107,15 @@ begin
   end;
   reset role;
 end $$;
+-- a device inserted without an org lands in the default org and is visible
+insert into public.devices (id, hostname) values ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'NO-ORG');
+do $$
+declare n int;
+begin
+  perform set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', true);
+  set local role authenticated;
+  select count(*) into n from public.devices where hostname = 'NO-ORG';
+  if n <> 1 then raise exception 'device inserted without org_id is hidden'; end if;
+  reset role;
+end $$;
 select 'RLS CHECKS PASSED';
