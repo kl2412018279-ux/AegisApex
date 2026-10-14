@@ -65,6 +65,10 @@ function LoginForm() {
           <p className="mt-1 text-sm text-slate-400">
             Sign in to access network telemetry & security audits
           </p>
+          <p className="mt-3 text-sm text-slate-300">
+            Demo login: <span className="font-mono text-emerald-400">admin@aa.local</span> /{' '}
+            <span className="font-mono text-emerald-400">password123</span>
+          </p>
         </div>
 
         {authErrorFailed && (
