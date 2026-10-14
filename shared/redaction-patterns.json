@@ -8,7 +8,9 @@
       "mode": "group",
       "tokenCategory": "PASS_HASH",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "cisco_type7_passwords",
@@ -18,7 +20,9 @@
       "mode": "group",
       "tokenCategory": "PASS_TYPE7",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "aruba_cx_ciphertext_plaintext",
@@ -28,7 +32,9 @@
       "mode": "group",
       "tokenCategory": "ARUBA_PASS",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "unix_aruba_crypt_hash",
@@ -48,7 +54,10 @@
       "tokenCategory": "JUNIPER_HASH",
       "secretGroup": 3,
       "quoteGroup": 2,
-      "prefixGroups": [1, " "]
+      "prefixGroups": [
+        1,
+        " "
+      ]
     },
     {
       "id": "fortinet_enc_passwords",
@@ -58,7 +67,9 @@
       "mode": "group",
       "tokenCategory": "FORTI_ENC",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "huawei_hp_cipher_simple",
@@ -68,7 +79,9 @@
       "mode": "group",
       "tokenCategory": "HUAWEI_PASS",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "paloalto_phash",
@@ -78,28 +91,58 @@
       "mode": "group",
       "tokenCategory": "PANOS_HASH",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "mikrotik_quoted_secrets",
       "description": "MikroTik RouterOS quoted secrets",
-      "regex": "((?:password|secret)=\")([^\"]+)(\")",
+      "regex": "((?:password|secret)=)(\")([^\"]+)(\")",
       "flags": "gi",
       "mode": "quoted",
       "tokenCategory": "MIKROTIK_PASS",
-      "secretGroup": 2,
-      "quoteGroup": 3,
-      "prefixGroups": [1]
+      "secretGroup": 3,
+      "quoteGroup": 2,
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "snmp_community_strings",
       "description": "SNMP Read/Write community strings and host notification tokens",
-      "regex": "(snmp-server\\s+(?:community|host\\s+\\S+\\s+(?:version\\s+\\S+\\s+)?))(\\S+)",
+      "regex": "(snmp-server\\s+(?:community\\s+|host\\s+\\S+\\s+(?:version\\s+\\S+\\s+)?))(\\S+)",
       "flags": "gi",
       "mode": "group",
       "tokenCategory": "SNMP_COMMUNITY",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
+    },
+    {
+      "id": "huawei_snmp_community",
+      "description": "Huawei VRP snmp-agent community strings",
+      "regex": "(snmp-agent\\s+community\\s+(?:read|write)\\s+(?:cipher\\s+)?)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "SNMP_COMMUNITY",
+      "secretGroup": 2,
+      "prefixGroups": [
+        1
+      ]
+    },
+    {
+      "id": "junos_vyos_snmp_community",
+      "description": "Junos / VyOS set-style SNMP community names",
+      "regex": "((?:set\\s+)?(?:service\\s+)?snmp\\s+community\\s+)(\\S+)",
+      "flags": "gi",
+      "mode": "group",
+      "tokenCategory": "SNMP_COMMUNITY",
+      "secretGroup": 2,
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "radius_tacacs_keys",
@@ -109,7 +152,9 @@
       "mode": "group",
       "tokenCategory": "AAA_KEY",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "ipsec_ike_psk",
@@ -119,7 +164,9 @@
       "mode": "group",
       "tokenCategory": "IPSEC_PSK",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     },
     {
       "id": "ssh_private_keys",
@@ -137,7 +184,9 @@
       "mode": "group",
       "tokenCategory": "GENERIC_SECRET",
       "secretGroup": 2,
-      "prefixGroups": [1]
+      "prefixGroups": [
+        1
+      ]
     }
   ]
 }

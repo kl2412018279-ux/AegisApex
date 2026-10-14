@@ -1,0 +1,57 @@
+!
+version 17.9
+service password-encryption
+hostname CORE-SW-01
+!
+enable algorithm-type scrypt secret 9 $9$abcdefghijklmn$ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefg
+username netadmin privilege 15 secret 9 $9$zyxwvutsrqponm$ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210zyxwvut
+!
+aaa new-model
+aaa authentication login default group tacacs+ local
+aaa accounting exec default start-stop group tacacs+
+aaa accounting commands 15 default start-stop group tacacs+
+!
+no ip http server
+no ip http secure-server
+ip ssh version 2
+login block-for 120 attempts 5 within 60
+!
+snmp-server group SNMPv3GRP v3 priv
+!
+ntp authentication-key 1 md5 0822455D0A16 7
+ntp authenticate
+ntp trusted-key 1
+ntp server 10.0.0.1 key 1
+!
+logging host 10.0.0.50
+logging trap informational
+!
+ip access-list standard MGMT-ACL
+ permit 10.0.0.0 0.0.0.255
+!
+control-plane
+ service-policy input COPP-POLICY
+!
+interface GigabitEthernet1/0/1
+ description Uplink to Core
+ switchport mode trunk
+!
+interface GigabitEthernet1/0/2
+ description UNUSED
+ switchport access vlan 999
+ shutdown
+!
+banner motd ^CAuthorized Access Only^C
+!
+line con 0
+ exec-timeout 5 0
+line vty 0 4
+ access-class MGMT-ACL in
+ exec-timeout 10 0
+ transport input ssh
+line vty 5 15
+ access-class MGMT-ACL in
+ exec-timeout 10 0
+ transport input ssh
+!
+end

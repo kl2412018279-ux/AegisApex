@@ -398,8 +398,10 @@ export async function POST(req: NextRequest) {
     const detectedPlatform = body.vendor || device.netmiko_type || device.vendor || 'cisco_xe';
     const vendorType = detectVendor(detectedPlatform);
 
-    // 1. Evaluate configuration deterministically via static regex rules
-    const cisResult = evaluateConfigDeterministically(sanitizedPayload, vendorType);
+    // 1. Evaluate the RAW config deterministically. It never leaves the
+    // server here, and redaction would hide values the rules must see
+    // (e.g. a "public" SNMP community). Evidence strings come back redacted.
+    const cisResult = evaluateConfigDeterministically(rawConfig, vendorType);
     const cisFloorRisk = normalizeRiskLevel(cisResult.riskLevel);
     const validatedFindings = cisResult.findings;
 
