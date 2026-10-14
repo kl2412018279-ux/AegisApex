@@ -1,4 +1,5 @@
-# Alternative to Vercel cron (the Hobby plan only allows daily jobs).
+# Runs the 5-minute background job. dashboard/vercel.json only schedules it
+# daily, because Vercel Hobby rejects deployments with more frequent crons.
 # Set repository secrets APP_BASE_URL (e.g. https://aegisapex.example.com)
 # and CRON_SECRET (same value as the dashboard's CRON_SECRET). Without them
 # this workflow does nothing. GitHub runs schedules on a best-effort basis,

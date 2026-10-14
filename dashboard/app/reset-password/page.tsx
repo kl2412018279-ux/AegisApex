@@ -21,7 +21,6 @@ export default function ResetPasswordPage() {
   const [error, setError] = useState('');
 
   const router = useRouter();
-  const supabase = createClient();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,7 +36,12 @@ export default function ResetPasswordPage() {
     }
 
     setLoading(true);
-    const { error: updateError } = await supabase.auth.updateUser({ password });
+    let updateError: { message: string } | null = null;
+    try {
+      ({ error: updateError } = await createClient().auth.updateUser({ password }));
+    } catch (err) {
+      updateError = { message: err instanceof Error ? err.message : 'Could not reach the authentication service.' };
+    }
     setLoading(false);
 
     if (updateError) {

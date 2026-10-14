@@ -55,11 +55,12 @@ pnpm install
 pnpm dev
 ```
 
-On Vercel, `dashboard/vercel.json` schedules two cron jobs:
-- `/api/cron/process` every 5 minutes: change tracking, remediation verification and alert delivery.
-- `/api/cron/digest` on Mondays at 08:00 UTC.
+Background jobs run from two places:
 
-Set `CRON_SECRET` in Vercel. The Hobby plan only allows daily cron jobs. On Hobby, use `.github/workflows/cron.yml` instead: add `APP_BASE_URL` and `CRON_SECRET` as repository secrets and GitHub Actions calls the same endpoints on the same schedule.
+- **`dashboard/vercel.json`** schedules `/api/cron/process` once a day and `/api/cron/digest` on Mondays at 08:00 UTC. Both schedules are valid on every Vercel plan; Hobby rejects the whole deployment if any cron runs more than once a day.
+- **`.github/workflows/cron.yml`** calls `/api/cron/process` every 5 minutes, which keeps alerts, change tracking and remediation verification timely. Add `APP_BASE_URL` and `CRON_SECRET` as repository secrets to turn it on.
+
+Set `CRON_SECRET` in Vercel as well; both callers send it as a bearer token. On Vercel Pro you can change the `process` schedule in `vercel.json` to `*/5 * * * *` and skip the GitHub workflow.
 
 ### 3. Agent
 

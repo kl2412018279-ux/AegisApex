@@ -18,7 +18,6 @@ function LoginForm() {
 
   const router = useRouter();
   const searchParams = useSearchParams();
-  const supabase = createClient();
 
   // Same-site paths only: an attacker-supplied ?next= must not redirect off-site.
   const rawNext = searchParams.get('next') || '/';
@@ -32,7 +31,7 @@ function LoginForm() {
     setError('');
 
     try {
-      const { error: signInError } = await supabase.auth.signInWithPassword({
+      const { error: signInError } = await createClient().auth.signInWithPassword({
         email: email.trim(),
         password,
       });
