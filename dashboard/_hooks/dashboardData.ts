@@ -1,28 +1,21 @@
 // dashboard/_hooks/dashboardData.ts
-// Browser-side reads (RLS-scoped to the signed-in user).
+// Data loading for the dashboard. The inventory comes from /api/devices;
+// the rest are browser reads scoped by Row Level Security.
 import { supabase } from '@/lib/supabase';
 import { sanitizeConfig } from '@/lib/sanitizer';
 import type { Device, ScanResult, Vulnerability } from '../_types/dashboard.types';
 import { getHighestRisk } from '../_utils/riskHelpers';
-
-// Explicit list: the migration hides credential columns from browser roles,
-// so select('*') would be refused. Keep in sync with supabase/tests/rls_check.sql.
-export const DEVICE_COLUMNS = [
-  'id', 'hostname', 'ip_address', 'management_ip', 'vendor', 'netmiko_type', 'connection_status',
-  'last_seen_at', 'created_at', 'risk_level', 'last_config', 'raw_version', 'os_version', 'org_id', 'is_mock',
-  'collection_interval_minutes', 'next_collection_at', 'last_collection_error',
-  'ssh_host_key_fingerprint', 'ssh_host_key_pinned_at',
-].join(', ');
+import { api } from '../_utils/api';
 
 export async function loadDevices(cachedRisk: (id: string) => string | undefined): Promise<Device[]> {
-  let { data, error } = await supabase.from('devices').select(`${DEVICE_COLUMNS}, suppliers(name)`);
-  if (error) {
-    // Projects without a suppliers relation.
-    ({ data, error } = await supabase.from('devices').select(DEVICE_COLUMNS));
-  }
-  if (error || !data) {
-    if (error) console.error('Supabase devices fetch error:', error);
-    return [];
+  let data: any[];
+  try {
+    // Server-side read: works with any devices schema and never exposes
+    // credential columns (see app/api/devices/route.ts).
+    ({ devices: data } = await api<{ devices: any[] }>('/api/devices'));
+  } catch (error) {
+    console.error('Device inventory fetch error:', error);
+    throw error;
   }
 
   const { data: scans } = await supabase.from('scans').select('device_id, risk_level, created_at').order('created_at', { ascending: false });
@@ -31,12 +24,12 @@ export async function loadDevices(cachedRisk: (id: string) => string | undefined
     if (s.device_id && s.risk_level && !latestScanRisk[s.device_id]) latestScanRisk[s.device_id] = s.risk_level;
   }
 
-  return (data as any[]).map((d) => ({
+  return data.map((d) => ({
     ...d,
     hostname: d.hostname || 'Unknown Host',
-    ip_address: d.ip_address || d.management_ip || '',
-    vendor: d.vendor || 'cisco',
-    netmiko_type: d.netmiko_type || 'cisco_ios',
+    ip_address: d.ip_address || d.management_ip || d.ip || '',
+    vendor: d.vendor || d.device_type || 'cisco',
+    netmiko_type: d.netmiko_type || d.device_type || 'cisco_ios',
     suppliers: d.suppliers || null,
     connection_status: d.connection_status || 'unknown',
     last_seen_at: d.last_seen_at || d.created_at,
