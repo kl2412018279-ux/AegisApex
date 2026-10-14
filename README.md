@@ -27,11 +27,12 @@ The dashboard never connects to devices. It queues jobs in `agent_jobs`; the age
 
 ### 1. Database
 
-Apply both migrations, in order, to your Supabase project (SQL editor, or `supabase db push`):
+Apply the migrations, in order, to your Supabase project (SQL editor, or `supabase db push`):
 
 ```
 supabase/migrations/20261014120000_aegisapex_upgrades.sql
 supabase/migrations/20261015090000_rate_limits.sql
+supabase/migrations/20261015120000_default_org.sql
 ```
 
 Read its header first. In short:
