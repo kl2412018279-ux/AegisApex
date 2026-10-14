@@ -26,6 +26,9 @@ if [ ! -f .env ]; then
 fi
 
 [ -x .venv/bin/python ] || "$PY" -m venv .venv
-.venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
+echo "Using $(.venv/bin/python --version)"
+.venv/bin/python -m pip install --disable-pip-version-check -q --upgrade pip
+echo "Installing / checking requirements (can take several minutes on a slow connection)..."
+.venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
 echo "Starting the agent. Press Ctrl+C to stop."
 exec .venv/bin/python worker.py
