@@ -54,7 +54,13 @@ export function useDashboard() {
   });
 
   const fetchDevices = useCallback(async () => {
-    const list = await loadDevices((id) => aiCacheRef.current[id]?.riskLevel);
+    let list: Device[];
+    try {
+      list = await loadDevices((id) => aiCacheRef.current[id]?.riskLevel);
+    } catch (err: any) {
+      toast.error('Could not load the device inventory', { description: err?.message || String(err) });
+      return;
+    }
     setDevices(list);
     setSelectedDevice((prev) => {
       // Deep link from alerts: /?device=<id>
