@@ -1,5 +1,6 @@
 // dashboard/app/api/cron/process/route.ts
-// Background processing (vercel.json schedules it every 5 minutes):
+// Background processing: every 5 minutes from .github/workflows/cron.yml,
+// plus a daily Vercel cron (Hobby plans allow only daily schedules):
 // change tracking on new snapshots, remediation verification, alert delivery.
 import { NextRequest, NextResponse } from 'next/server';
 import { requireCron } from '@/lib/auth';

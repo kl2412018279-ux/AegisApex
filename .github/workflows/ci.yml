@@ -25,6 +25,10 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      # No env vars on purpose: the build must not depend on secrets.
+      - run: pnpm build
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
 
   agent:
     runs-on: ubuntu-latest

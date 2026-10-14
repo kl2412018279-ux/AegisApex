@@ -16,16 +16,20 @@ export default function ForgotPasswordPage() {
   const [error, setError] = useState('');
   const [sent, setSent] = useState(false);
 
-  const supabase = createClient();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError('');
 
-    const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo: `${window.location.origin}/auth/callback?next=/reset-password`,
-    });
+    let resetError: { message: string } | null = null;
+    try {
+      ({ error: resetError } = await createClient().auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${window.location.origin}/auth/callback?next=/reset-password`,
+      }));
+    } catch (err) {
+      resetError = { message: err instanceof Error ? err.message : 'Could not reach the authentication service.' };
+    }
 
     setLoading(false);
 
