@@ -1,5 +1,4 @@
-//  C:\Users\hp\aiops-securewatch\dashboard\_components\ConfigTab.tsx
-// C:\Users\hp\aiops-securewatch\dashboard\_components\ConfigTab.tsx
+// dashboard/_components/ConfigTab.tsx
 import React, { useMemo } from 'react';
 import { Code2, ShieldAlert, Shield } from 'lucide-react';
 import { sanitizeConfig } from '@/lib/sanitizer';
@@ -142,6 +141,7 @@ export function ConfigTab({
                         isDarkMode ? 'text-slate-100' : 'text-slate-800'
                       }`}
                     >
+                      {v.rule_id && <span className="font-mono text-slate-500 mr-1.5">{v.rule_id}</span>}
                       {v.title}
                     </span>
                     <span
@@ -158,6 +158,13 @@ export function ConfigTab({
                   >
                     {v.description}
                   </p>
+
+                  {v.evidence && (
+                    <p className="text-[10px] font-mono break-all">
+                      <span className="text-slate-500 font-bold uppercase mr-1">Evidence:</span>
+                      {v.evidence}
+                    </p>
+                  )}
 
                   {remediation && (
                     <div

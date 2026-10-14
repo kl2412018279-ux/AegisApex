@@ -1,0 +1,43 @@
+# Alternative to Vercel cron (the Hobby plan only allows daily jobs).
+# Set repository secrets APP_BASE_URL (e.g. https://aegisapex.example.com)
+# and CRON_SECRET (same value as the dashboard's CRON_SECRET). Without them
+# this workflow does nothing. GitHub runs schedules on a best-effort basis,
+# so expect occasional delays of a few minutes.
+name: Background jobs
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # change tracking, remediation verification, alerts
+    - cron: '0 8 * * 1'     # weekly digest
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Which job to run
+        type: choice
+        options: [process, digest]
+        default: process
+
+permissions: {}
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+    steps:
+      - name: Call cron endpoint
+        run: |
+          if [ -z "$APP_BASE_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "APP_BASE_URL / CRON_SECRET secrets not set; skipping."
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            job="${{ inputs.job }}"
+          elif [ "${{ github.event.schedule }}" = "0 8 * * 1" ]; then
+            job=digest
+          else
+            job=process
+          fi
+          curl --fail-with-body -sS -H "Authorization: Bearer $CRON_SECRET" "$APP_BASE_URL/api/cron/$job"

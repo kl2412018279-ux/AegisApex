@@ -14,13 +14,7 @@ export function FleetPrintReport({ devices, generatedDate }: FleetPrintReportPro
   const criticals = devices.filter((d) => (d.risk_level || (d as any).riskLevel) === 'CRITICAL').length;
   const highs = devices.filter((d) => (d.risk_level || (d as any).riskLevel) === 'HIGH').length;
   const mediums = devices.filter((d) => (d.risk_level || (d as any).riskLevel) === 'MEDIUM').length;
-  // FIX: the original formula was (total - criticals - highs) / total, which
-  // silently counts every never-scanned device (UNASSESSED / undefined
-  // risk_level) as "compliant". A fresh fleet of 100 devices that has never
-  // been audited reported a 100% posture score. Compliance can only be
-  // claimed for devices that have actually been assessed; unscanned devices
-  // are neither compliant nor non-compliant, they're unknown, and are now
-  // excluded from both sides of the ratio.
+  // Unassessed devices are unknown, not compliant: excluded from both sides.
   const unassessed = devices.filter((d) => {
     const r = (d.risk_level || (d as any).riskLevel || '').toUpperCase();
     return !r || r === 'UNASSESSED';
@@ -35,8 +29,6 @@ export function FleetPrintReport({ devices, generatedDate }: FleetPrintReportPro
     {
       label: 'Fleet Posture Score',
       value: `${compliant}%`,
-      // FIX: make the "of what" explicit on the printed report, since the
-      // score now excludes never-scanned devices from the calculation
       sub: unassessed > 0 ? `of ${assessed} assessed · ${unassessed} unscanned excluded` : undefined,
     },
   ];

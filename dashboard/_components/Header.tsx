@@ -1,4 +1,4 @@
-//header.tsx
+// dashboard/_components/Header.tsx
 import React, { useState, useRef, useEffect } from 'react';
 import {
   Server,
@@ -11,6 +11,10 @@ import {
   ChevronDown,
   Check,
   LogOut,
+  GitCompare,
+  BarChart3,
+  Wrench,
+  Users,
 } from 'lucide-react';
 import { NavigationTab, Device } from '../_types/dashboard.types';
 
@@ -53,6 +57,30 @@ const TAB_CONFIG: Record<
     title: 'CLI Command Impact Simulation Sandbox',
     darkClass: 'bg-amber-500/10 border-amber-500/20 text-amber-400',
     lightClass: 'bg-amber-50/80 border-amber-200 text-amber-700',
+  },
+  changes: {
+    icon: GitCompare,
+    title: 'Configuration Changes & Collection',
+    darkClass: 'bg-cyan-500/10 border-cyan-500/20 text-cyan-400',
+    lightClass: 'bg-cyan-50/80 border-cyan-200 text-cyan-700',
+  },
+  compliance: {
+    icon: BarChart3,
+    title: 'Fleet Trends & Compliance',
+    darkClass: 'bg-indigo-500/10 border-indigo-500/20 text-indigo-400',
+    lightClass: 'bg-indigo-50/80 border-indigo-200 text-indigo-700',
+  },
+  remediation: {
+    icon: Wrench,
+    title: 'Remediation Requests & Approvals',
+    darkClass: 'bg-rose-500/10 border-rose-500/20 text-rose-400',
+    lightClass: 'bg-rose-50/80 border-rose-200 text-rose-700',
+  },
+  admin: {
+    icon: Users,
+    title: 'Organization Administration',
+    darkClass: 'bg-slate-500/10 border-slate-500/20 text-slate-300',
+    lightClass: 'bg-slate-100 border-slate-300 text-slate-700',
   },
 };
 

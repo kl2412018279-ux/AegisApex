@@ -1,35 +1,7 @@
-// C:\Users\hp\aiops-securewatch\dashboard\app\login\page.tsx
 // dashboard/app/login/page.tsx
-//
-// Rewritten from the version you added, which built the whole page with
-// React.createElement() instead of JSX — no functional reason to do that
-// in a .tsx file, just harder to read and edit. This is plain JSX.
-//
-// FIX: `next` is preserved through the flow. Your original hard-coded
-// router.push('/') after a successful login, so if the auth middleware
-// redirected someone here from a deep link (e.g. they had /?tab=sandbox
-// open in a tab that expired), a successful login always dropped them on
-// the root page instead of back where they were headed. Now reads
-// ?next=... from the URL (set by middleware.ts, added in this delivery)
-// and returns there after sign-in.
-//
-// DELIBERATE: no "create account" / sign-up link. You said this is for one
-// dedicated entity with no role system — a public self-registration link
-// on a device-audit tool's login page would let a stranger create an
-// account for themselves if email signups are enabled on your Supabase
-// project. Create the one account you need directly in the Supabase
-// dashboard (Authentication > Users > Add user) instead. If your Supabase
-// project currently has "Allow new users to sign up" turned on, turn it
-// off (Authentication > Providers > Email) — that setting matters more
-// than anything on this page, since it controls whether an API call to
-// supabase.auth.signUp() from outside this UI could create an account
-// regardless of what links this page does or doesn't show.
-//
-// BUILD FIX: useSearchParams() must be called inside a component that is
-// wrapped in <Suspense>, or `next build` fails trying to statically
-// prerender this page ("useSearchParams() should be wrapped in a suspense
-// boundary"). The actual form + all its logic now lives in LoginForm;
-// LoginPage just wraps it in Suspense.
+// No self-service sign-up link: accounts are created by an org admin
+// (Admin tab → Members, which sends an invite). useSearchParams() needs the
+// <Suspense> wrapper below for `next build`.
 'use client';
 
 import React, { Suspense, useState } from 'react';
@@ -48,12 +20,7 @@ function LoginForm() {
   const searchParams = useSearchParams();
   const supabase = createClient();
 
-  // FIX: safe redirect target only. `next` comes from the URL, which is
-  // attacker-controllable (anyone can send someone a link with any ?next=
-  // value). Only accept a same-site path starting with a single "/" —
-  // reject absolute URLs and protocol-relative "//host" values, which
-  // would otherwise let a crafted link send a successfully-authenticated
-  // user off to an external site right after they prove who they are.
+  // Same-site paths only: an attacker-supplied ?next= must not redirect off-site.
   const rawNext = searchParams.get('next') || '/';
   const next = rawNext.startsWith('/') && !rawNext.startsWith('//') ? rawNext : '/';
 

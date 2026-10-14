@@ -1,7 +1,7 @@
 // dashboard/app/page.tsx
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createBrowserClient } from '@supabase/ssr';
 import { useDashboard } from '@/_hooks/useDashboard';
@@ -13,11 +13,28 @@ import { InventoryTab } from '@/_components/InventoryTab';
 import { ConfigTab } from '@/_components/ConfigTab';
 import { VersionTab } from '@/_components/VersionTab';
 import { SandboxTab } from '@/_components/SandboxTab';
+import { ChangesTab } from '@/_components/ChangesTab';
+import { ComplianceTab } from '@/_components/ComplianceTab';
+import { RemediationTab } from '@/_components/RemediationTab';
+import { AdminTab } from '@/_components/AdminTab';
+import { useMe } from '@/_hooks/useMe';
+import { api } from '@/_utils/api';
 
 export default function DashboardPage() {
   const dash = useDashboard();
   const router = useRouter();
   const [printMode, setPrintMode] = useState<'device' | 'fleet' | null>(null);
+  const { me, hasRole } = useMe();
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+  const isAdmin = hasRole('admin');
+  const canOperate = hasRole('operator', dash.selectedDevice?.org_id);
+  const isAdminFor = useCallback((orgId?: string | null) => hasRole('admin', orgId), [hasRole]);
+
+  useEffect(() => {
+    api<{ requests: Array<{ status: string }> }>('/api/remediation')
+      .then((d) => setPendingApprovals(d.requests.filter((r) => r.status === 'pending_approval').length))
+      .catch(() => undefined);
+  }, []);
 
   // Resolve fresh device from updated devices list to avoid stale state
   const activeDevice =
@@ -155,6 +172,9 @@ export default function DashboardPage() {
           handleCollectTelemetry={dash.handleCollectTelemetry}
           handleRunScan={dash.handleRunScan}
           handleScanAll={dash.handleScanAll}
+          isAdmin={isAdmin}
+          canOperate={canOperate}
+          pendingApprovals={pendingApprovals}
         />
 
         <main className="flex-1 flex flex-col h-full overflow-hidden">
@@ -220,6 +240,34 @@ export default function DashboardPage() {
                 sandboxAnalysis={dash.sandboxAnalysis}
                 handleAnalyzeCommand={dash.handleAnalyzeCommand}
               />
+            )}
+
+            {dash.activeTab === 'changes' && (
+              <ChangesTab
+                isDarkMode={dash.isDarkMode}
+                device={activeDevice}
+                canOperate={canOperate}
+                isAdmin={isAdminFor(activeDevice?.org_id)}
+                onDeviceUpdated={dash.fetchDevices}
+              />
+            )}
+
+            {dash.activeTab === 'compliance' && <ComplianceTab isDarkMode={dash.isDarkMode} />}
+
+            {dash.activeTab === 'remediation' && (
+              <RemediationTab
+                isDarkMode={dash.isDarkMode}
+                device={activeDevice}
+                latestScan={dash.latestScan}
+                canOperate={canOperate}
+                isAdminFor={isAdminFor}
+                userId={me?.userId ?? null}
+                onPendingCount={setPendingApprovals}
+              />
+            )}
+
+            {dash.activeTab === 'admin' && isAdmin && (
+              <AdminTab isDarkMode={dash.isDarkMode} memberships={me?.memberships || []} currentUserId={me?.userId ?? null} />
             )}
           </div>
         </main>

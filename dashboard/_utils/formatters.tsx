@@ -243,16 +243,7 @@ export function renderFormattedAnalysis(text: string, isDark: boolean) {
               }
 
               // Severity Callout Cards
-              // FIX (real bug, confirmed by hand): these were unanchored,
-              // so the word "critical" appearing ANYWHERE in ordinary
-              // prose — e.g. the good-news line "No critical baseline CVE
-              // matches identified for this OS image." — matched \bCRITICAL\b
-              // case-insensitively and wrapped an all-clear message in a
-              // red "HIGH RISK IMPACT" alert box. Anchored to the start of
-              // the line with ^, matching how renderCleanAnalysis already
-              // does this correctly further down this same file — a
-              // severity tag has to be what the line IS, not just a word
-              // it happens to contain.
+              // Anchored: "No critical CVEs found" must not render as a CRITICAL callout.
               const isCritical = /^\[critical\]|^\bCRITICAL\b/i.test(trimmed) && !trimmed.startsWith('#');
               const isHigh = /^\[high\]|^\bHIGH RISK\b/i.test(trimmed) && !trimmed.startsWith('#');
               const isWarning = /^\[warning\]|^\[medium\]|^\bWARNING\b/i.test(trimmed) && !trimmed.startsWith('#');

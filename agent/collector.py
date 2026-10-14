@@ -1,69 +1,38 @@
 # agent/collector.py
 #
-# Merged from your original collector.py and the Gemini-refactored version
-# you asked me to compare it against. Kept:
-#   - your paging-disable commands and global_delay_factor=2 (original) —
-#     dropping these is a real hardware-behavior change I can't verify
-#     against your actual fleet, so I did not adopt Gemini's removal of them
-#   - Gemini's Supabase-key fallback fix (no silent anon-key fallback)
-#   - Gemini's single-client-per-device pattern (was up to 5 instantiations
-#     per device in the original)
-#   - Gemini's logged (not swallowed) error on the offline-status write
-# Fixed beyond both versions:
-#   - the "admin" hardcoded username fallback is gone; a device with no
-#     resolvable username now fails loudly instead of guessing
-#   - ssh_user is resolved from the vault RPC result AND the devices table
-#     (matches your actual schema: ssh_user lives directly on `devices`,
-#     only the passwords are vaulted) — Gemini's version dropped the
-#     devices-table fallback entirely, which would silently connect as
-#     "admin" on any device with a real username set on its row but not
-#     returned by the RPC
-#   - devices.raw_version is written again (Gemini's version dropped it;
-#     your dashboard reads raw_version primarily from `scans`, but a
-#     future fleet-wide version report reading `devices` alone would see
-#     blanks without this)
-import os
-import sys
-import re
+# SSH collection and change application for every supported platform.
+# Used by worker.py (job queue) and runnable directly:
+#
+#   python collector.py                  # every active device, once
+#   python collector.py --device-id ID   # one device
 import argparse
 import logging
-from pathlib import Path
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Iterator, Optional
+
 from dotenv import load_dotenv
-from supabase import create_client, Client
 from netmiko import ConnectHandler
+from supabase import Client, create_client
+
+import hostkeys
 
 BASE_DIR = Path(__file__).resolve().parent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("collector")
 
-# Load environment variables — agent/.env only. If you were relying on the
-# original's 4-location cascade (repo root / dashboard/.env.local /
-# dashboard/.env), make sure agent/.env has everything it needs; see
-# agent/.env.example.
 load_dotenv(BASE_DIR / ".env")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-# FIX: no anon-key fallback. The original's fallback chain ended at
-# NEXT_PUBLIC_SUPABASE_ANON_KEY — the SAME key shipped in the dashboard's
-# browser bundle. If SUPABASE_SERVICE_ROLE_KEY was ever unset, the agent
-# would silently run under the public key instead of failing loudly. If
-# get_device_credentials() has EXECUTE granted to anon/authenticated (check
-# this — see the SQL file in this delivery), that fallback could let this
-# same "credential" be used by anyone with the public key, not just the
-# agent. Missing the service key is now a hard failure, not a silent
-# downgrade.
+# Service role only. There is deliberately no fallback to the public anon key.
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
 
-# Multi-Vendor Command Matrix (Config & OS Telemetry).
-# Kept from the original: the paging-disable command per vendor. Netmiko
-# auto-disables paging for many of its built-in device_types during
-# connection setup, but I can't confirm that holds for all 19 entries here
-# without testing against real hardware of each type — if this dict was
-# added because you hit a real truncation issue on some device, removing it
-# (as the Gemini refactor did) would silently reintroduce that bug. Left in.
+# Paging-disable, config and version commands per Netmiko device_type.
 VENDOR_COMMAND_MAP = {
     "cisco_ios": {"paging": "terminal length 0", "config": "show running-config", "version": "show version"},
     "cisco_xe": {"paging": "terminal length 0", "config": "show running-config", "version": "show version"},
@@ -86,220 +55,289 @@ VENDOR_COMMAND_MAP = {
     "mikrotik_routeros": {"paging": None, "config": "/export", "version": "/system resource print"},
 }
 
+# Platforms where configuration changes only take effect after a commit.
+COMMIT_PLATFORMS = {"juniper_junos", "cisco_xr", "paloalto_panos", "vyos", "nokia_sros"}
+
+
+class CollectionError(Exception):
+    pass
+
 
 def get_supabase_client() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError(
-            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in agent/.env. "
-            "The agent will not fall back to an anon key — see the comment above SUPABASE_KEY."
-        )
+        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in agent/.env.")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def fetch_decrypted_credentials(device_id: str, supabase: Client) -> dict:
     try:
-        rpc_res = supabase.rpc("get_device_credentials", {"p_device_id": device_id}).execute()
-        if rpc_res.data and len(rpc_res.data) > 0:
-            return rpc_res.data[0]
+        res = supabase.rpc("get_device_credentials", {"p_device_id": device_id}).execute()
+        if res.data:
+            return res.data[0]
     except Exception as e:
-        log.warning(f"RPC Vault error for device {device_id}: {e}")
+        log.warning(f"Vault RPC error for device {device_id}: {e}")
     return {}
+
+
+_VERSION_PATTERNS = [
+    r"junos:?\s*([0-9]+\.[0-9]+[0-9A-Za-z.\-]*)",
+    r"sw-version:\s*([0-9]+\.[0-9]+[0-9A-Za-z.\-]*)",
+    r"fortigate[^\n]*?v([0-9]+\.[0-9]+\.[0-9]+)",
+    r"version:\s*v?([0-9]+\.[0-9]+[0-9A-Za-z.\-]*)",
+    r"(?:version|v)\s*([0-9]+\.[0-9]+[0-9a-zA-Z.()\-_]*)",
+]
 
 
 def extract_clean_os_version(raw_version_text: str) -> str:
     if not raw_version_text:
         return ""
-    match = re.search(r'(?:version|v|junos:?)\s*([0-9]+\.[0-9]+[0-9a-zA-Z\.\(\)\-\_]*)', raw_version_text, re.IGNORECASE)
-    return match.group(1) if match else ""
+    for pattern in _VERSION_PATTERNS:
+        match = re.search(pattern, raw_version_text, re.IGNORECASE)
+        if match:
+            return match.group(1).rstrip(",.")
+    return ""
 
 
-def process_device(device: dict):
-    # FIX (Gemini's improvement, adopted): one client per device instead of
-    # the original's up to 5 separate instantiations (config write, status
-    # write, raw_version write, scan write, error write).
-    supabase = get_supabase_client()
+def device_host(device: dict) -> str:
+    return device.get("management_ip") or device.get("ip_address") or ""
 
-    device_id = device.get("id")
-    device_ip = device.get("management_ip") or device.get("ip_address")
-    netmiko_type = device.get("netmiko_type") or "cisco_xe"
 
-    vault_creds = fetch_decrypted_credentials(device_id, supabase)
+@contextmanager
+def open_session(device: dict, supabase: Client) -> Iterator[object]:
+    """Opens an authenticated, host-key-verified Netmiko session."""
+    device_id = device["id"]
+    host = device_host(device)
+    if not host:
+        raise CollectionError("Device has no management IP configured.")
 
-    # FIX: username resolution now checks the vault RPC result AND the
-    # devices table (your schema stores ssh_user directly on `devices` —
-    # it's not secret, only the passwords are vaulted). Gemini's version
-    # checked only the RPC result; if get_device_credentials() doesn't
-    # happen to return ssh_user, that version would silently try "admin"
-    # even for a device with a real username set on its row. And unlike
-    # both prior versions, a device with a password but genuinely no
-    # resolvable username now fails loudly instead of guessing "admin".
-    username = vault_creds.get("ssh_user") or device.get("ssh_user")
-    password = vault_creds.get("ssh_pass") or ""
-    secret = vault_creds.get("enable_pass") or password
-    ssh_port = device.get("ssh_port") or 22
-
+    creds = fetch_decrypted_credentials(device_id, supabase)
+    username = creds.get("ssh_user") or device.get("ssh_user")
+    password = creds.get("ssh_pass") or ""
     if not password:
-        log.info(f"Skipped {device_ip} ({device_id}): no SSH password found in Vault.")
-        return
-
+        raise CollectionError("No SSH password found in Vault for this device.")
     if not username:
-        log.warning(
-            f"Skipped {device_ip} ({device_id}): no SSH username found in Vault or on the "
-            f"devices row (ssh_user). Refusing to guess a default credential — set ssh_user "
-            f"on the device or return it from get_device_credentials()."
-        )
-        return
+        raise CollectionError("No SSH username in Vault or on the devices row (ssh_user). Refusing to guess one.")
 
-    log.info(f"Starting collection for {device_ip} (Vendor: {netmiko_type}, ID: {device_id})")
+    port = int(device.get("ssh_port") or 22)
+    pinned = hostkeys.ensure_pinned(device, host, port, supabase)
+    if pinned.newly_pinned:
+        log.info(f"Pinned SSH host key for {host}: {pinned.fingerprint} (trust on first use)")
+    known_hosts = hostkeys.write_known_hosts(host, port, pinned)
 
+    params = {
+        "device_type": device.get("netmiko_type") or "cisco_xe",
+        "host": host,
+        "username": username,
+        "password": password,
+        "secret": creds.get("enable_pass") or password,
+        "port": port,
+        "timeout": 30,
+        "auth_timeout": 60,
+        "fast_cli": False,
+        # 2 rather than 1: slower but safer on congested or VPN-tunneled
+        # out-of-band management links.
+        "global_delay_factor": 2,
+        **hostkeys.strict_connection_params(known_hosts),
+    }
+    conn = None
     try:
-        connection_params = {
-            "device_type": netmiko_type,
-            "host": device_ip,
-            "username": username,
-            "password": password,
-            "secret": secret,
-            "port": ssh_port,
-            "timeout": 30,
-            "auth_timeout": 60,
-            "fast_cli": False,
-            # Kept at 2 (original), not lowered to 1 (Gemini). Halving this
-            # halves Netmiko's internal wait/read timers — fine on healthy
-            # low-latency links, more likely to mistime reads on slow,
-            # congested, or VPN-tunneled out-of-band management connections.
-            # If your whole fleet is reliably low-latency, 1 is safe and
-            # faster; verify before lowering it.
-            "global_delay_factor": 2,
-        }
-
-        net_connect = ConnectHandler(**connection_params)
-
-        if hasattr(net_connect, "enable"):
-            try:
-                net_connect.enable()
-            except Exception as e:
-                log.warning(f"Enable mode warning for {device_ip}: {e}")
-
-        cmd_info = VENDOR_COMMAND_MAP.get(netmiko_type, VENDOR_COMMAND_MAP["cisco_ios"])
-        if cmd_info.get("paging"):
-            net_connect.send_command(cmd_info["paging"])
-
-        # 1. Collect OS / Firmware Version Telemetry
-        raw_version = ""
-        if cmd_info.get("version"):
-            raw_version = net_connect.send_command(cmd_info["version"])
-
-        # 2. Collect Running Configuration Telemetry
-        raw_config = net_connect.send_command(cmd_info["config"])
-        net_connect.disconnect()
-
-        if not raw_config or len(raw_config.strip()) < 15:
-            log.warning(f"Empty or invalid config received for device {device_id}. Skipping.")
-            return
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        clean_version = extract_clean_os_version(raw_version)
-
-        # 3. Write snapshot into configurations table
-        config_payload = {
-            "device_id": device_id,
-            "raw_config": raw_config,
-            "content": raw_config,
-            "created_at": now_iso,
-        }
-        config_res = supabase.table("configurations").insert(config_payload).execute()
-        log.info(f"Configuration snapshot saved for {device_ip}")
-
-        # 4. Synchronize device status, running config, and OS telemetry
-        device_update = {
-            "connection_status": "online",
-            "last_seen_at": now_iso,
-            "last_config": raw_config,
-        }
-        if clean_version:
-            device_update["os_version"] = clean_version
-
+        conn = ConnectHandler(**params)
         try:
-            supabase.table("devices").update(device_update).eq("id", device_id).execute()
-            log.info(f"Status, last_config & OS Version ({clean_version or 'raw'}) updated for {device_ip}")
-        except Exception:
-            # Fallback if os_version column is named differently in your schema
-            device_update.pop("os_version", None)
-            supabase.table("devices").update(device_update).eq("id", device_id).execute()
-            log.info(f"Status & last_config updated for {device_ip} (os_version update skipped)")
-
-        # 5. raw_version on the devices row (kept from the original; Gemini's
-        # version dropped this — the dashboard mostly reads raw_version from
-        # `scans`, but a fleet-wide report querying `devices` alone would
-        # otherwise see this column blank per-device).
-        try:
-            supabase.table("devices").update({"raw_version": raw_version}).eq("id", device_id).execute()
+            conn.enable()
         except Exception as e:
-            log.warning(f"Could not write raw_version for {device_ip}: {e}")
+            log.debug(f"Enable mode not entered on {host}: {e}")
+        paging = VENDOR_COMMAND_MAP.get(params["device_type"], VENDOR_COMMAND_MAP["cisco_ios"]).get("paging")
+        if paging:
+            conn.send_command(paging)
+        yield conn
+    finally:
+        if conn is not None:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+        os.unlink(known_hosts)
 
-        # 6. Insert scan record so the dashboard's polling succeeds
-        configuration_id = config_res.data[0].get("id") if config_res.data else None
-        scan_payload = {
-            "device_id": device_id,
-            "configuration_id": configuration_id,
-            "raw_version": raw_version,
-            "summary": f"Telemetry collected successfully via SSH on {now_iso}",
-            "risk_level": "UNASSESSED",
-            "created_at": now_iso,
-        }
-        try:
-            supabase.table("scans").insert(scan_payload).execute()
-            log.info(f"Scan telemetry event inserted for {device_ip}")
-        except Exception as scan_err:
-            log.warning(f"Failed to insert scan event record for {device_ip}: {scan_err}")
 
-        log.info(f"Collection complete for {device_ip}")
+def capture(conn, netmiko_type: str) -> tuple:
+    cmds = VENDOR_COMMAND_MAP.get(netmiko_type, VENDOR_COMMAND_MAP["cisco_ios"])
+    raw_version = conn.send_command(cmds["version"]) if cmds.get("version") else ""
+    raw_config = conn.send_command(cmds["config"])
+    if not raw_config or len(raw_config.strip()) < 15:
+        raise CollectionError("Device returned an empty or truncated configuration.")
+    return raw_version, raw_config
 
+
+def store_snapshot(
+    supabase: Client,
+    device: dict,
+    raw_config: str,
+    raw_version: str,
+    source: str = "ssh",
+    current: bool = True,
+) -> Optional[str]:
+    """
+    Saves a config snapshot. When `current`, it also becomes the device's
+    latest state (devices row + an UNASSESSED scans row). Returns the id.
+    """
+    ts = now_iso()
+    config_res = supabase.table("configurations").insert({
+        "device_id": device["id"],
+        "raw_config": raw_config,
+        "content": raw_config,
+        "source": source,
+        "created_at": ts,
+    }).execute()
+    configuration_id = config_res.data[0]["id"] if config_res.data else None
+    if not current:
+        return configuration_id
+
+    update = {
+        "connection_status": "online",
+        "last_seen_at": ts,
+        "last_config": raw_config,
+        "raw_version": raw_version,
+        "last_collection_error": None,
+    }
+    clean_version = extract_clean_os_version(raw_version)
+    if clean_version:
+        update["os_version"] = clean_version
+    try:
+        supabase.table("devices").update(update).eq("id", device["id"]).execute()
     except Exception as e:
-        log.error(f"SSH or ingestion error for device {device_ip} ({device_id}): {e}")
+        log.warning(f"Device update failed ({e}); retrying without os_version")
+        update.pop("os_version", None)
+        supabase.table("devices").update(update).eq("id", device["id"]).execute()
+
+    if configuration_id:
         try:
-            # FIX (Gemini's improvement, adopted): logged, not silently
-            # swallowed — the original's bare `except: pass` here meant a
-            # failure to even mark a device offline left no trace anywhere.
-            supabase.table("devices").update({"connection_status": "offline"}).eq("id", device_id).execute()
-        except Exception as db_err:
-            log.error(f"Failed to set offline status for {device_ip}: {db_err}")
+            supabase.table("scans").insert({
+                "device_id": device["id"],
+                "configuration_id": configuration_id,
+                "raw_version": raw_version,
+                "summary": f"Telemetry collected via SSH at {ts}",
+                "risk_level": "UNASSESSED",
+                "created_at": ts,
+            }).execute()
+        except Exception as e:
+            log.warning(f"Scan record insert failed for {device['id']}: {e}")
+    return configuration_id
 
 
-def run_collector(target_device_id: str = None, max_workers: int = 5):
+def raise_alert(supabase: Client, device: dict, kind: str, severity: str, title: str, body: str) -> None:
+    """Queues an alert; the dashboard's /api/cron/process delivers it."""
+    try:
+        supabase.table("alert_events").insert({
+            "org_id": device.get("org_id"),
+            "device_id": device["id"],
+            "kind": kind,
+            "severity": severity,
+            "title": title,
+            "body": body,
+        }).execute()
+    except Exception as e:
+        log.error(f"Could not queue {kind} alert for {device['id']}: {e}")
+
+
+def mark_unreachable(supabase: Client, device: dict, exc: BaseException) -> str:
+    host_key_message = hostkeys.describe_failure(exc)
+    message = host_key_message or f"{type(exc).__name__}: {exc}"
+    was_unreachable = device.get("connection_status") == "unreachable"
+    try:
+        supabase.table("devices").update({
+            "connection_status": "unreachable",
+            "last_collection_error": message[:1000],
+        }).eq("id", device["id"]).execute()
+    except Exception as db_err:
+        log.error(f"Failed to set unreachable status for {device['id']}: {db_err}")
+
+    name = device.get("hostname") or device_host(device)
+    if host_key_message:
+        raise_alert(supabase, device, "host_key_mismatch", "CRITICAL", f"SSH host key problem on {name}", message)
+    elif not was_unreachable:
+        raise_alert(supabase, device, "device_unreachable", "HIGH", f"{name} is unreachable", message)
+    return message
+
+
+def collect_device(device: dict, supabase: Client) -> dict:
+    """Collects one device. Raises on failure (caller marks it unreachable)."""
+    log.info(f"Collecting {device_host(device)} ({device.get('netmiko_type')}, {device['id']})")
+    with open_session(device, supabase) as conn:
+        raw_version, raw_config = capture(conn, device.get("netmiko_type") or "cisco_xe")
+    configuration_id = store_snapshot(supabase, device, raw_config, raw_version)
+    log.info(f"Collection complete for {device_host(device)}")
+    return {"configuration_id": configuration_id}
+
+
+def apply_commands(device: dict, supabase: Client, commands: list, save: bool = True) -> dict:
+    """
+    Pushes configuration commands, then snapshots the config before and after
+    so the change can be verified and diffed. Returns the device output.
+    """
+    netmiko_type = device.get("netmiko_type") or "cisco_xe"
+    with open_session(device, supabase) as conn:
+        _, pre_config = capture(conn, netmiko_type)
+        output = conn.send_config_set(commands, exit_config_mode=netmiko_type not in COMMIT_PLATFORMS)
+        if netmiko_type in COMMIT_PLATFORMS:
+            output += "\n" + conn.commit()
+            conn.exit_config_mode()
+        elif save:
+            try:
+                output += "\n" + conn.save_config()
+            except NotImplementedError:
+                output += "\n[agent] save_config is not supported on this platform; change is in the running config only."
+        raw_version, post_config = capture(conn, netmiko_type)
+
+    pre_id = store_snapshot(supabase, device, pre_config, raw_version, source="ssh", current=False)
+    post_id = store_snapshot(supabase, device, post_config, raw_version, source="post_remediation")
+    return {"output": output, "pre_configuration_id": pre_id, "post_configuration_id": post_id}
+
+
+def process_device(device: dict) -> bool:
     supabase = get_supabase_client()
+    try:
+        collect_device(device, supabase)
+        return True
+    except Exception as e:
+        message = mark_unreachable(supabase, device, e)
+        log.error(f"Collection failed for {device_host(device)} ({device['id']}): {message}")
+        return False
 
-    query = supabase.table("devices").select("*")
-    if target_device_id:
-        query = query.eq("id", target_device_id)
-    else:
-        query = query.neq("connection_status", "inactive")
 
-    response = query.execute()
-    devices = response.data or []
-
+def run_collector(target_device_id: Optional[str] = None, max_workers: int = 5) -> tuple:
+    supabase = get_supabase_client()
+    query = supabase.table("devices").select("*").eq("is_mock", False)
+    query = query.eq("id", target_device_id) if target_device_id else query.neq("connection_status", "inactive")
+    devices = query.execute().data or []
     if not devices:
         log.info("No target devices found to collect.")
-        return
+        return 0, 0
 
-    log.info(f"Launching collection for {len(devices)} device(s) across {max_workers} worker(s)...")
-
+    log.info(f"Collecting {len(devices)} device(s) with {max_workers} worker(s)...")
+    succeeded = failed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # NOTE (unchanged from both prior versions): executor.map() does not
-        # raise exceptions from worker threads until the results are
-        # iterated, and results here are never iterated — so an exception
-        # inside process_device() for one device is currently swallowed by
-        # the executor itself, on top of the try/except already inside
-        # process_device(). That inner try/except is what actually protects
-        # you today; this is noted for awareness, not changed, since
-        # iterating results to surface exceptions is a slightly bigger
-        # behavior change than the rest of this pass.
-        executor.map(process_device, devices)
+        futures = {executor.submit(process_device, d): d for d in devices}
+        for future in as_completed(futures):
+            device = futures[future]
+            try:
+                ok = future.result()
+            except Exception as e:  # process_device handles its own errors; this is a bug guard
+                log.exception(f"Unexpected error collecting {device['id']}: {e}")
+                ok = False
+            succeeded += ok
+            failed += not ok
+    log.info(f"Collection finished: {succeeded} succeeded, {failed} failed.")
+    return succeeded, failed
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AegisApex Collector")
     parser.add_argument("--device-id", type=str, help="Target a specific device UUID")
+    parser.add_argument("--workers", type=int, default=5)
     args = parser.parse_args()
-
-    run_collector(target_device_id=args.device_id, max_workers=5)
+    _, failures = run_collector(target_device_id=args.device_id, max_workers=args.workers)
+    raise SystemExit(1 if failures else 0)

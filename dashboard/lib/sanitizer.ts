@@ -1,5 +1,4 @@
 // dashboard/lib/sanitizer.ts
-// dashboard/lib/sanitizer.ts
 import patternSpec from '../../shared/redaction-patterns.json';
 
 export interface TokenizedResult {
@@ -17,7 +16,8 @@ interface RedactionPattern {
   mode: PatternMode;
   tokenCategory: string;
   secretGroup?: number;
-  prefixGroups?: number[];
+  /** Capture-group numbers, or literal strings, joined to rebuild the text before the secret. */
+  prefixGroups?: Array<number | string>;
   quoteGroup?: number;
 }
 
@@ -30,6 +30,10 @@ const TOKEN_PATTERN = /__TOKEN_[A-Z0-9_]+_\d+__/g;
 function buildRegex(pattern: RedactionPattern): RegExp {
   const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
   return new RegExp(pattern.regex, flags);
+}
+
+function buildPrefix(prefixGroups: Array<number | string> | undefined, groups: string[]): string {
+  return (prefixGroups || []).map((g) => (typeof g === 'number' ? groups[g - 1] ?? '' : g)).join('');
 }
 
 /**
@@ -88,9 +92,7 @@ export function tokenizeConfig(configText: string): TokenizedResult {
           const secretValue = groups[secretIdx];
           if (!secretValue) return fullMatch;
 
-          const prefix = (p.prefixGroups || [])
-            .map((g) => groups[g - 1] ?? '')
-            .join('');
+          const prefix = buildPrefix(p.prefixGroups, groups);
 
           // Preserve trailing CLI syntax within fullMatch after secretGroup
           const secretPos = fullMatch.indexOf(secretValue);
@@ -111,10 +113,8 @@ export function tokenizeConfig(configText: string): TokenizedResult {
           const secretValue = groups[secretIdx];
           if (!secretValue) return fullMatch;
 
-          const quote = groups[(p.quoteGroup as number) - 1] || '"';
-          const prefix = (p.prefixGroups || [])
-            .map((g) => groups[g - 1] ?? '')
-            .join('');
+          const quote = groups[(p.quoteGroup as number) - 1] ?? '';
+          const prefix = buildPrefix(p.prefixGroups, groups);
 
           const secretPos = fullMatch.indexOf(secretValue);
           const suffix = secretPos !== -1 ? fullMatch.slice(secretPos + secretValue.length + quote.length) : '';

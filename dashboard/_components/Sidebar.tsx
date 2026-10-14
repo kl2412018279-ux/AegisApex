@@ -9,6 +9,10 @@ import {
   Terminal as TerminalIcon,
   RefreshCw,
   Layers,
+  GitCompare,
+  BarChart3,
+  Wrench,
+  Users,
 } from 'lucide-react';
 import { NavigationTab, Device } from '../_types/dashboard.types';
 
@@ -28,6 +32,9 @@ interface SidebarProps {
   handleCollectTelemetry: () => void;
   handleRunScan: () => void;
   handleScanAll: () => void;
+  isAdmin: boolean;
+  canOperate: boolean;
+  pendingApprovals: number;
 }
 
 const NAV_ITEMS: { id: NavigationTab; label: string; icon: React.ElementType; color: string }[] = [
@@ -35,6 +42,10 @@ const NAV_ITEMS: { id: NavigationTab; label: string; icon: React.ElementType; co
   { id: 'config', label: 'show running-config', icon: FileText, color: 'text-purple-500 dark:text-purple-400' },
   { id: 'version', label: 'show version & OS', icon: Cpu, color: 'text-blue-500 dark:text-blue-400' },
   { id: 'sandbox', label: 'Impact Sandbox', icon: TerminalIcon, color: 'text-amber-500 dark:text-amber-400' },
+  { id: 'changes', label: 'Changes & Collection', icon: GitCompare, color: 'text-cyan-500 dark:text-cyan-400' },
+  { id: 'compliance', label: 'Trends & Compliance', icon: BarChart3, color: 'text-indigo-500 dark:text-indigo-400' },
+  { id: 'remediation', label: 'Remediation', icon: Wrench, color: 'text-rose-500 dark:text-rose-400' },
+  { id: 'admin', label: 'Admin', icon: Users, color: 'text-slate-500 dark:text-slate-300' },
 ];
 
 export function Sidebar({
@@ -49,6 +60,9 @@ export function Sidebar({
   handleCollectTelemetry,
   handleRunScan,
   handleScanAll,
+  isAdmin,
+  canOperate,
+  pendingApprovals,
 }: SidebarProps) {
   const extDevice = selectedDevice as ExtendedDevice | null;
   const displayIp = extDevice?.ip_address || extDevice?.management_ip || '0.0.0.0';
@@ -130,7 +144,7 @@ export function Sidebar({
 
         {/* Dynamic Navigation */}
         <nav className="p-3 space-y-1.5">
-          {NAV_ITEMS.map((item) => {
+          {NAV_ITEMS.filter((item) => item.id !== 'admin' || isAdmin).map((item) => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
             return (
@@ -149,6 +163,11 @@ export function Sidebar({
               >
                 <Icon className={`w-4 h-4 shrink-0 ${item.color}`} />
                 <span>{item.label}</span>
+                {item.id === 'remediation' && pendingApprovals > 0 && (
+                  <span className="ml-auto px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-rose-600 text-white" aria-label={`${pendingApprovals} awaiting approval`}>
+                    {pendingApprovals}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -192,7 +211,7 @@ export function Sidebar({
 
         <button
           onClick={handleCollectTelemetry}
-          disabled={isScanning || isScanningAll || !selectedDevice}
+          disabled={!canOperate || isScanning || isScanningAll || !selectedDevice}
           className={`w-full flex items-center justify-center gap-2 px-3 py-2.5 font-bold rounded-lg text-xs transition-all shadow-sm border cursor-pointer ${
             isDarkMode
               ? 'bg-blue-600 hover:bg-blue-500 border-blue-500 disabled:bg-slate-800 disabled:border-slate-700 disabled:text-slate-600'
@@ -214,7 +233,7 @@ export function Sidebar({
 
         <button
           onClick={handleRunScan}
-          disabled={isScanning || isScanningAll || !selectedDevice}
+          disabled={!canOperate || isScanning || isScanningAll || !selectedDevice}
           className={`w-full flex items-center justify-center gap-2 px-3 py-2.5 font-bold rounded-lg text-xs transition-all shadow-sm border cursor-pointer ${
             isDarkMode
               ? 'bg-emerald-600 hover:bg-emerald-500 border-emerald-500 disabled:bg-slate-800 disabled:border-slate-700 disabled:text-slate-600'
@@ -236,7 +255,7 @@ export function Sidebar({
 
         <button
           onClick={handleScanAll}
-          disabled={isScanning || isScanningAll || devicesLength === 0}
+          disabled={!canOperate || isScanning || isScanningAll || devicesLength === 0}
           className={`w-full flex items-center justify-center gap-2 px-3 py-2.5 font-bold rounded-lg text-xs transition-all shadow-sm border cursor-pointer ${
             isDarkMode
               ? 'bg-red-700 hover:bg-red-500 border-red-500 disabled:bg-slate-800 disabled:border-slate-700 disabled:text-slate-600'

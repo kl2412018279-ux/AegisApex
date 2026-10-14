@@ -1,5 +1,5 @@
-// dashboard/app/_hooks/useDashboard.ts
-import { useState, useEffect } from 'react';
+// dashboard/_hooks/useDashboard.ts
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
 
 import { supabase } from '@/lib/supabase';
@@ -8,6 +8,10 @@ import { exportBulkPDF } from '@/lib/bulkExport';
 
 import { NavigationTab, AiCacheEntry, Device, ScanResult } from '../_types/dashboard.types';
 import { getHighestRisk } from '../_utils/riskHelpers';
+import { api } from '../_utils/api';
+import { buildImpactMarkdown } from '../_utils/impactMarkdown';
+import { loadDevices, loadLatestScan, latestScanRef, configText } from './dashboardData';
+import { watchJob } from './jobWatcher';
 
 export function useDashboard() {
   const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
@@ -17,7 +21,6 @@ export function useDashboard() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<Device | null>(null);
   const [latestScan, setLatestScan] = useState<ScanResult | null>(null);
-
   const [aiCache, setAiCache] = useState<Record<string, AiCacheEntry>>({});
 
   const [proposedCommand, setProposedCommand] = useState<string>('');
@@ -25,15 +28,14 @@ export function useDashboard() {
   const [analyzingCommand, setAnalyzingCommand] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [isScanningAll, setIsScanningAll] = useState<boolean>(false);
-  const [scanProgress, setScanProgress] = useState<{ current: number; total: number }>({
-    current: 0,
-    total: 0,
-  });
-
+  const [scanProgress, setScanProgress] = useState<{ current: number; total: number }>({ current: 0, total: 0 });
   const [selectedRiskFilter, setSelectedRiskFilter] = useState<string>('ALL');
   const [isExportingBulk, setIsExportingBulk] = useState<boolean>(false);
 
-  // Derived state getters
+  const aiCacheRef = useRef(aiCache);
+  aiCacheRef.current = aiCache;
+  const stopJobWatch = useRef<(() => void) | null>(null);
+
   const currentRawConfig = latestScan?.raw_config
     ? sanitizeConfig(latestScan.raw_config)
     : selectedDevice?.last_config
@@ -41,601 +43,196 @@ export function useDashboard() {
     : '';
 
   const currentRawVersion =
-    latestScan?.raw_version ||
-    latestScan?.show_version ||
-    latestScan?.os_version ||
-    selectedDevice?.raw_version ||
-    ((selectedDevice as any)?.os_version ? `Cisco IOS Software, Version ${(selectedDevice as any).os_version}` : '');
-
+    latestScan?.raw_version || selectedDevice?.raw_version || (selectedDevice?.os_version ? `Version ${selectedDevice.os_version}` : '');
   const currentOsSummary = latestScan?.os_summary || latestScan?.version_info || '';
 
-  const activeDeviceRisk = selectedDevice?.id
-    ? getHighestRisk(selectedDevice.risk_level, aiCache[selectedDevice.id]?.riskLevel)
-    : 'UNASSESSED';
+  const activeDeviceRisk = selectedDevice?.id ? getHighestRisk(selectedDevice.risk_level, aiCache[selectedDevice.id]?.riskLevel) : 'UNASSESSED';
 
   const filteredDevices = devices.filter((dev) => {
     if (selectedRiskFilter === 'ALL') return true;
-    const risk = (dev.risk_level || 'UNASSESSED').toUpperCase();
-    return risk.includes(selectedRiskFilter.toUpperCase());
+    return (dev.risk_level || 'UNASSESSED').toUpperCase().includes(selectedRiskFilter.toUpperCase());
   });
 
-  useEffect(() => {
-    fetchDevices();
+  const fetchDevices = useCallback(async () => {
+    const list = await loadDevices((id) => aiCacheRef.current[id]?.riskLevel);
+    setDevices(list);
+    setSelectedDevice((prev) => {
+      // Deep link from alerts: /?device=<id>
+      const wanted = prev?.id || (typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('device') : null);
+      return list.find((d) => d.id === wanted) || list[0] || null;
+    });
+  }, []);
+
+  const fetchScanResults = useCallback(async (deviceId: string) => {
+    try {
+      setLatestScan(await loadLatestScan(deviceId, aiCacheRef.current[deviceId]?.riskLevel));
+    } catch (err) {
+      console.error('Error fetching scan results:', err);
+    }
   }, []);
 
   useEffect(() => {
-    if (selectedDevice?.id) {
-      fetchScanResults(selectedDevice.id);
-    }
-  }, [selectedDevice?.id]);
+    fetchDevices();
+    return () => stopJobWatch.current?.();
+  }, [fetchDevices]);
 
-  async function fetchDevices() {
-    const { data: devicesData, error: devError } = await supabase
-      .from('devices')
-      .select('*, suppliers(*)');
+  useEffect(() => {
+    if (selectedDevice?.id) fetchScanResults(selectedDevice.id);
+  }, [selectedDevice?.id, fetchScanResults]);
 
-    if (devError || !devicesData || devicesData.length === 0) {
-      if (devError) console.error('Supabase devices fetch error:', devError);
-      setDevices([]);
-      return;
-    }
+  // Live device status (online / unreachable / risk) without polling.
+  useEffect(() => {
+    const channel = supabase
+      .channel('devices-live')
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'devices' }, () => fetchDevices())
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchDevices]);
 
-    const { data: scansData, error: scanError } = await supabase
-      .from('scans')
-      .select('device_id, risk_level, created_at')
-      .order('created_at', { ascending: false });
-
-    if (scanError) console.warn('Could not fetch scans metadata:', scanError);
-
-    const scanMap: Record<string, string> = {};
-    if (scansData) {
-      for (const scan of scansData) {
-        if (scan.device_id && !scanMap[scan.device_id] && scan.risk_level) {
-          scanMap[scan.device_id] = scan.risk_level;
-        }
-      }
-    }
-
-    const formattedDevices: Device[] = devicesData.map((d: any) => {
-      const dbScanRisk = scanMap[d.id];
-      const cachedRisk = aiCache[d.id]?.riskLevel;
-
-      const highestDbRisk = getHighestRisk(d.risk_level, dbScanRisk);
-      const normalizedRisk = getHighestRisk(highestDbRisk, cachedRisk);
-
-      return {
-        id: d.id,
-        hostname: d.hostname || 'Unknown Host',
-        ip_address: d.ip_address || d.management_ip || d.ip || '127.0.0.1',
-        vendor: d.vendor || d.device_type || 'cisco',
-        netmiko_type: d.netmiko_type || d.device_type || 'cisco_ios',
-        suppliers: d.suppliers || null,
-        connection_status: d.connection_status || 'online',
-        last_seen_at: d.last_seen_at || d.created_at,
-        risk_level: normalizedRisk,
-        ssh_user: d.ssh_user || null,
-        ssh_pass: d.ssh_pass || null,
-        last_config: d.last_config || null,
-        raw_version: d.raw_version || d.os_version || null,
-        os_version: d.os_version || null,
-      };
-    });
-
-    setDevices(formattedDevices);
-    setSelectedDevice((prev: any) => {
-      if (!prev) return formattedDevices[0];
-      const updated = formattedDevices.find((fd: any) => fd.id === prev.id);
-      return updated || formattedDevices[0];
-    });
-  }
-
-  async function fetchScanResults(deviceId: string) {
-    if (!deviceId) return;
-
+  async function persistRisk(deviceId: string, riskLevel: string) {
     try {
-      const { data: scanData, error: scanErr } = await supabase
-        .from('scans')
-        .select('*')
-        .eq('device_id', deviceId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (!scanData || scanErr) {
-        setLatestScan(null);
-        return;
-      }
-
-      let rawConfigText = '';
-      if (scanData.configuration_id) {
-        const { data: configData } = await supabase
-          .from('configurations')
-          .select('*')
-          .eq('id', scanData.configuration_id)
-          .maybeSingle();
-        rawConfigText = configData?.raw_config || configData?.content || '';
-      }
-
-      let vulns: any[] = [];
-      if (scanData.id) {
-        const { data: vulnData } = await supabase
-          .from('vulnerabilities')
-          .select('*')
-          .eq('scan_id', scanData.id);
-        vulns = vulnData || [];
-      }
-
-      if (vulns.length === 0) {
-        const jsonFindings = scanData.vulnerabilities || scanData.findings;
-        if (Array.isArray(jsonFindings)) {
-          vulns = jsonFindings;
-        } else if (typeof jsonFindings === 'string') {
-          try {
-            vulns = JSON.parse(jsonFindings);
-          } catch (e) {
-            console.error('Error parsing JSON findings:', e);
-          }
-        }
-      }
-
-      // FIX: the Version tab's AI panel used to fall back to scans.summary
-      // when os_summary was empty. But scans.summary is the CONFIG audit
-      // text, so the Version tab showed the config findings ("7 Benchmark
-      // Rules Violated"). OS text now comes only from scans.os_summary.
-      let osSummaryText = scanData.os_summary || '';
-      let versionInfoText = osSummaryText;
-
-      if (osSummaryText && !osSummaryText.includes('OS/Firmware Security') && !osSummaryText.includes('🔍')) {
-        if (osSummaryText.length < 100 && !osSummaryText.includes('\n')) {
-          osSummaryText =
-            `🔍 **OS/Firmware Security Analysis**\n\n` +
-            `**Version Detected:** ${osSummaryText}\n\n` +
-            `*Run "Re-analyze Firmware" for detailed security assessment.*`;
-        } else {
-          osSummaryText = `🔍 **OS/Firmware Security Analysis**\n\n${osSummaryText}`;
-          versionInfoText = osSummaryText;
-        }
-      }
-
-      // FIX: this used to fill os_summary with a "Raw Version Data
-      // Collected ... Click Run AI Assessment" placeholder whenever the
-      // collector had saved raw_version but no AI analysis existed yet.
-      // That text is not an analysis, but the Version tab treated any
-      // non-empty os_summary as "AI has run": the AI panel showed the
-      // placeholder and the hero cards showed vendor defaults. Now
-      // os_summary stays empty until /api/analyze-firmware really runs.
-      // The raw text is still shown in the left "Collected Version
-      // Telemetry" panel (it reads raw_version, not os_summary).
-
-      // FIX: removed the block that appended the CONFIG findings ("Security
-      // Findings ... 2 more findings") onto the OS text. They belong to the
-      // Config tab and are still returned in latestScan.vulnerabilities.
-
-      let displaySummary = scanData.summary;
-      if ((!displaySummary || displaySummary.includes('Telemetry collected')) && vulns.length > 0) {
-        displaySummary = `Security Audit completed: ${vulns.length} risk finding(s) detected.`;
-      }
-
-      const calculatedScanRisk = scanData.risk_level || (vulns.length > 0 ? 'HIGH' : 'LOW');
-      const cachedRisk = aiCache[deviceId]?.riskLevel;
-      const normalizedThreatLevel = getHighestRisk(calculatedScanRisk, cachedRisk);
-
-      setLatestScan({
-        scanned_at: scanData.created_at || new Date().toISOString(),
-        raw_config: rawConfigText ? sanitizeConfig(rawConfigText) : '',
-        risk_level: normalizedThreatLevel,
-        summary: displaySummary || 'No summary available',
-        vulnerabilities: vulns,
-        model_used: scanData.model_used || 'Groq Llama-3',
-        raw_version: scanData.raw_version || '',
-        show_version: scanData.raw_version || '',
-        os_version: scanData.raw_version || '',
-        os_summary: osSummaryText,
-        version_info: versionInfoText,
-        os_cves: [],
-        target_firmware: scanData.target_firmware || 'Not yet analyzed',
-        eol_status: scanData.eol_status || 'Not yet analyzed',
-      });
-    } catch (err) {
-      console.error('Error fetching scan results:', err);
+      await api('/api/update-device-risk', { method: 'POST', json: { deviceId, riskLevel } });
+    } catch (err: any) {
+      console.error('Failed to persist risk level:', err);
+      toast.error(`Database update failed: ${err.message}`);
     }
   }
 
   async function handleCollectTelemetry() {
     if (!selectedDevice) return;
+    const device = selectedDevice;
     setIsScanning(true);
-    const triggerStartTime = new Date().toISOString(); // Timestamp marker to prevent false polling success
-
     try {
-      const res = await fetch('/api/trigger-collection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceId: selectedDevice.id }),
-      });
+      const data = await api<{ mode: string; jobId?: string; message: string }>('/api/trigger-collection', { method: 'POST', json: { deviceId: device.id } });
 
-      const data = await res.json();
-
-      if (res.ok) {
-        toast.info('📡 Telemetry Collection Started', {
-          description: 'SSH agent fetching show running-config and show version. This may take 10-30s.',
-        });
-
-        let attempts = 0;
-        const maxAttempts = 30;
-        const pollInterval = setInterval(async () => {
-          attempts++;
-          // Filter by created_at > triggerStartTime to only detect NEW scans generated by the collector
-          const { data: scanData } = await supabase
-            .from('scans')
-            .select('*')
-            .eq('device_id', selectedDevice.id)
-            .gt('created_at', triggerStartTime)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-          if (scanData) {
-            clearInterval(pollInterval);
-            setIsScanning(false);
-            toast.success('✅ Telemetry Collection Complete!', {
-              description: 'Click "Run AI Assessment" to analyze the updated telemetry data.',
-            });
-            await fetchScanResults(selectedDevice.id);
-            await fetchDevices();
-          } else if (attempts >= maxAttempts) {
-            clearInterval(pollInterval);
-            setIsScanning(false);
-            toast.error('⏰ Telemetry Collection Timed Out', {
-              description: 'Please check if the SSH agent is running and reachability to the device.',
-            });
-          }
-        }, 2000);
-      } else {
-        toast.error('❌ Collection Failed', {
-          description: data.error || 'Unknown server error occurred.',
-        });
-        setIsScanning(false);
-      }
-    } catch (err: any) {
-      console.error('Error triggering collection:', err);
-      toast.error('❌ Network Error', {
-        description: err.message,
-      });
-      setIsScanning(false);
-    }
-  }
-
-  async function handleRunScan() {
-    if (!selectedDevice) return;
-    setIsScanning(true);
-
-    try {
-      const { data: existingScans } = await supabase
-        .from('scans')
-        .select('*')
-        .eq('device_id', selectedDevice.id)
-        .order('created_at', { ascending: false })
-        .limit(1);
-
-      const scan = existingScans && existingScans.length > 0 ? existingScans[0] : null;
-
-      let rawConfigContent = selectedDevice.last_config || '';
-      if (!rawConfigContent && scan?.configuration_id) {
-        const { data: configData } = await supabase
-          .from('configurations')
-          .select('*')
-          .eq('id', scan.configuration_id)
-          .maybeSingle();
-        rawConfigContent = configData?.raw_config || configData?.content || '';
-      }
-
-      if (!rawConfigContent) {
-        toast.warning('⚠️ Missing Configuration Data', {
-          description: 'No telemetry configuration found for this device. Please collect telemetry first.',
-        });
+      if (data.mode === 'synthetic') {
+        toast.warning('🧪 Demo telemetry generated', { description: data.message });
+        await fetchScanResults(device.id);
+        await fetchDevices();
         setIsScanning(false);
         return;
       }
 
-      const rawVersionContent = scan?.raw_version || selectedDevice.raw_version || (selectedDevice as any).os_version || '';
-
-      let osAnalysisResult: any = null;
-      let configAnalysisResult: any = null;
-
-      if (rawVersionContent) {
-        try {
-          const firmwareRes = await fetch('/api/analyze-firmware', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              deviceId: selectedDevice.id,
-              vendor: selectedDevice.vendor || 'Cisco',
-              rawVersion: rawVersionContent,
-            }),
+      toast.info('📡 Collection queued', { description: 'The AegisApex agent will connect over SSH. This usually takes 10–60 seconds.' });
+      stopJobWatch.current?.();
+      stopJobWatch.current = watchJob(data.jobId!, async (outcome) => {
+        setIsScanning(false);
+        if (outcome.status === 'succeeded') {
+          toast.success('✅ Telemetry collected', { description: 'Click "Run AI Assessment" to analyze it.' });
+        } else if (outcome.status === 'failed') {
+          toast.error('❌ Collection failed', { description: outcome.error || 'The agent could not reach the device.' });
+        } else {
+          toast.error('⏰ Still waiting for the agent', {
+            description: 'No agent has picked up the job. Check that agent/worker.py is running and can reach Supabase.',
           });
-
-          if (firmwareRes.ok) osAnalysisResult = await firmwareRes.json();
-        } catch (err) {
-          console.error('Error in OS analysis:', err);
         }
-      }
+        await fetchScanResults(device.id);
+        await fetchDevices();
+      });
+    } catch (err: any) {
+      toast.error('❌ Collection request failed', { description: err.message });
+      setIsScanning(false);
+    }
+  }
 
-      try {
-        // FIX (real bug, confirmed by hand, round 2): `scan` was fetched at
-        // the very TOP of this function, BEFORE /api/analyze-firmware ran.
-        // On a device's first-ever successful scan — no `scans` row exists
-        // yet — `scan` is null at that point. /api/analyze-firmware (called
-        // just above) then correctly INSERTS the device's first scans row,
-        // with target_firmware/eol_status populated. But passing the STALE
-        // `scan?.id` (still null) here made /api/scan take its own INSERT
-        // branch instead of updating that just-created row — forking a
-        // second `scans` row with risk_level/summary but no
-        // target_firmware/eol_status at all (scan/route.ts's insert payload
-        // never sets those two columns). fetchScanResults() always reads
-        // the single most-recently-created row, so it picked up this
-        // second, blank-on-those-two-fields row and showed "Not yet
-        // analyzed" even though analyze-firmware's real answer had been
-        // saved correctly seconds earlier, to a different, now-orphaned
-        // row. We now re-fetch the device's current latest scan right
-        // before calling /api/scan, so it always lands on whichever row
-        // /api/analyze-firmware just touched — first-ever run or not —
-        // instead of trusting a value captured before that call happened.
-        const { data: refreshedScans } = await supabase
-          .from('scans')
-          .select('id, configuration_id')
-          .eq('device_id', selectedDevice.id)
-          .order('created_at', { ascending: false })
-          .limit(1);
-        const refreshedScan = refreshedScans && refreshedScans.length > 0 ? refreshedScans[0] : null;
+  /** Firmware first (it may create the device's first scans row), then config on that same row. */
+  async function assessDevice(device: Device) {
+    const before = await latestScanRef(device.id);
+    const rawConfig = await configText(device, before?.configuration_id);
+    const rawVersion = before?.raw_version || device.raw_version || '';
 
-        const configRes = await fetch('/api/scan', {
+    const firmware = rawVersion
+      ? await api('/api/analyze-firmware', { method: 'POST', json: { deviceId: device.id, rawVersion } }).catch((e) => {
+          console.error('Firmware analysis failed:', e);
+          return null;
+        })
+      : null;
+
+    const after = await latestScanRef(device.id);
+    const config = rawConfig
+      ? await api('/api/scan', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            deviceId: selectedDevice.id,
-            scanId: refreshedScan?.id || scan?.id || null,
-            configurationId: refreshedScan?.configuration_id || scan?.configuration_id || null,
-            vendor: selectedDevice.vendor || 'Cisco',
-            rawConfig: rawConfigContent,
-            rawVersion: rawVersionContent,
-          }),
-        });
+          json: { deviceId: device.id, scanId: after?.id ?? null, configurationId: after?.configuration_id ?? null, rawConfig, rawVersion },
+        }).catch((e) => {
+          console.error('Config analysis failed:', e);
+          return null;
+        })
+      : null;
 
-        if (configRes.ok) configAnalysisResult = await configRes.json();
-      } catch (err) {
-        console.error('Error in config analysis:', err);
+    return { firmware, config, hadConfig: !!rawConfig };
+  }
+
+  async function handleRunScan() {
+    if (!selectedDevice) return;
+    const device = selectedDevice;
+    setIsScanning(true);
+    try {
+      const { firmware, config, hadConfig } = await assessDevice(device);
+      if (!hadConfig) {
+        toast.warning('⚠️ Missing configuration data', { description: 'Collect telemetry first.' });
+        return;
       }
+      const findings = config?.findings || [];
+      const risk = getHighestRisk(config?.riskLevel, firmware?.riskLevel);
 
-      const finalVulns = configAnalysisResult?.vulnerabilities || configAnalysisResult?.findings || [];
-      const configRisk = configAnalysisResult?.riskLevel || (finalVulns.length > 0 ? 'HIGH' : 'LOW');
-      const osRisk = osAnalysisResult?.riskLevel || 'LOW';
-      const normalizedUnifiedRisk = getHighestRisk(configRisk, osRisk);
-
-      const finalSummary = configAnalysisResult?.summary || 'AI Security Assessment completed successfully.';
-      const finalOsSummary = osAnalysisResult?.osSummary || scan?.os_summary || '';
-
-      setAiCache((prev) => ({
-        ...prev,
-        [selectedDevice.id]: {
-          config: finalSummary,
-          firmware: finalOsSummary,
-          riskLevel: normalizedUnifiedRisk,
-        },
-      }));
-
-      try {
-        const res = await fetch('/api/update-device-risk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            deviceId: selectedDevice.id,
-            riskLevel: normalizedUnifiedRisk,
-          }),
-        });
-
-        const resData = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          console.error('DB Update error:', resData.error);
-          toast.error(`Database Update Failed: ${resData.error || 'Unknown error'}`);
-        }
-      } catch (err: any) {
-        console.error('Failed to update single device risk level:', err);
-        toast.error(`Network Error Updating Database: ${err.message}`);
-      }
-
-      await fetchScanResults(selectedDevice.id);
+      setAiCache((prev) => ({ ...prev, [device.id]: { config: config?.summary || '', firmware: firmware?.osSummary || '', riskLevel: risk } }));
+      await persistRisk(device.id, risk);
+      await fetchScanResults(device.id);
       await fetchDevices();
 
-      if (finalVulns.length > 0) {
-        toast.error(`🔒 AI Scan Complete: ${normalizedUnifiedRisk} Risk`, {
-          description: `Detected ${finalVulns.length} potential security vulnerability(ies).`,
-        });
-      } else {
-        toast.success('✅ AI Analysis Complete');
+      if (firmware?.kevCount) {
+        toast.error(`🚨 ${firmware.kevCount} actively exploited CVE(s) affect this firmware`);
       }
+      if (findings.length) toast.error(`🔒 Assessment complete: ${risk}`, { description: `${findings.length} CIS rule(s) violated.` });
+      else toast.success('✅ Assessment complete');
     } catch (err: any) {
-      console.error('Error in AI analysis:', err);
-      toast.error('❌ AI Analysis Error', {
-        description: err.message,
-      });
+      toast.error('❌ AI analysis error', { description: err.message });
     } finally {
       setIsScanning(false);
     }
   }
 
   async function handleScanAll() {
-    if (!devices || devices.length === 0 || isScanningAll) return;
-
+    if (!devices.length || isScanningAll) return;
     setIsScanningAll(true);
     setScanProgress({ current: 0, total: devices.length });
-
+    let failures = 0;
     try {
-      // FIX (race, same one handleRunScan already fixed): this used to fire
-      // /api/scan and /api/analyze-firmware AT THE SAME TIME for each
-      // device (Promise.all). For a device with no scans row yet, both saw
-      // "no row", so each created its own scans row - two rows per device,
-      // the Version and Config data split between them. Now, per device:
-      // firmware first, then re-read the latest scan row, then /api/scan
-      // updates that same row.
-      //
-      // Devices also run one after another now (not all at once). Each
-      // device costs 2 Groq calls; running 6+ devices in parallel was a
-      // burst of 12+ calls at once, which is how you get Groq 503/429.
-      const results: Array<{
-        id: string;
-        hostname: string;
-        ip: string;
-        configText: string;
-        firmwareText: string;
-        riskLevel: string;
-      }> = [];
-
+      // Sequential: each device costs two LLM calls; bursts trigger 429s.
       for (const dev of devices) {
-        const { data: scanData } = await supabase
-          .from('scans')
-          .select('*')
-          .eq('device_id', dev.id)
-          .order('created_at', { ascending: false })
-          .limit(1);
-
-        const latestScanRecord = scanData && scanData.length > 0 ? scanData[0] : null;
-
-        let configContent = dev.last_config || '';
-        if (!configContent && latestScanRecord?.configuration_id) {
-          const { data: cfg } = await supabase
-            .from('configurations')
-            .select('raw_config, content')
-            .eq('id', latestScanRecord.configuration_id)
-            .maybeSingle();
-          configContent = cfg?.raw_config || cfg?.content || '';
-        }
-
-        const versionContent = dev.raw_version || (dev as any).os_version || latestScanRecord?.raw_version || '';
-
-        // 1) firmware first (it may create the device's first scans row)
-        const firmwareRes = await fetch('/api/analyze-firmware', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            deviceId: dev.id,
-            vendor: dev.vendor || 'Cisco',
-            rawVersion: versionContent,
-          }),
-        }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-
-        // 2) re-read the latest row AFTER firmware ran
-        const { data: refreshedScans } = await supabase
-          .from('scans')
-          .select('id, configuration_id')
-          .eq('device_id', dev.id)
-          .order('created_at', { ascending: false })
-          .limit(1);
-        const refreshedScan = refreshedScans && refreshedScans.length > 0 ? refreshedScans[0] : null;
-
-        // 3) config scan updates that same row
-        const configRes = await fetch('/api/scan', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            deviceId: dev.id,
-            scanId: refreshedScan?.id || latestScanRecord?.id || null,
-            vendor: dev.vendor || 'Cisco',
-            rawConfig: configContent,
-            rawVersion: versionContent,
-            configurationId: refreshedScan?.configuration_id || latestScanRecord?.configuration_id || null,
-          }),
-        }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-
-        const configText = configRes?.output || configRes?.summary || '';
-        const firmwareText = firmwareRes?.output || firmwareRes?.osSummary || firmwareRes?.summary || '';
-        const computedDevRisk = getHighestRisk(configRes?.riskLevel, firmwareRes?.riskLevel);
-
-        setScanProgress((prev) => ({ ...prev, current: prev.current + 1 }));
-
-        results.push({
-          id: dev.id,
-          hostname: dev.hostname,
-          ip: dev.ip_address,
-          configText,
-          firmwareText,
-          riskLevel: computedDevRisk,
-        });
+        const { firmware, config } = await assessDevice(dev);
+        if (!config && !firmware) failures++;
+        const risk = getHighestRisk(config?.riskLevel, firmware?.riskLevel);
+        setAiCache((prev) => ({ ...prev, [dev.id]: { config: config?.summary || '', firmware: firmware?.osSummary || '', riskLevel: risk } }));
+        if (risk !== 'UNASSESSED') await persistRisk(dev.id, risk);
+        setScanProgress((p) => ({ ...p, current: p.current + 1 }));
       }
-
-      const newCache: Record<string, AiCacheEntry> = {};
-
-      results.forEach((res) => {
-        newCache[res.id] = {
-          config: res.configText,
-          firmware: res.firmwareText,
-          riskLevel: res.riskLevel,
-        };
-      });
-
-      setAiCache((prev) => ({ ...prev, ...newCache }));
-
-      await Promise.all(
-        results.map(async (res) => {
-          if (!res.riskLevel) return;
-          try {
-            const apiRes = await fetch('/api/update-device-risk', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                deviceId: res.id,
-                riskLevel: res.riskLevel,
-              }),
-            });
-
-            const apiData = await apiRes.json().catch(() => ({}));
-            if (!apiRes.ok) {
-              console.error(`DB Update error for device ${res.id}:`, apiData.error);
-            }
-          } catch (err) {
-            console.error(`Failed to update risk level for device ${res.id}:`, err);
-          }
-        })
-      );
-
       await fetchDevices();
-
-      toast.success('🚀 Bulk Inventory Scan Finished', {
-        description: `Successfully analyzed ${results.length} devices. Saved to database.`,
+      if (selectedDevice?.id) await fetchScanResults(selectedDevice.id);
+      toast.success('🚀 Inventory scan finished', {
+        description: `${devices.length - failures} of ${devices.length} devices analyzed.${failures ? ' Devices without telemetry were skipped.' : ''}`,
       });
-
-      if (selectedDevice?.id) {
-        await fetchScanResults(selectedDevice.id);
-      }
     } catch (error) {
-      console.error('Error during bulk scan:', error);
-      toast.error('❌ Bulk Scan Failed', {
-        description: 'An unexpected error occurred while auditing inventory.',
-      });
+      console.error('Bulk scan error:', error);
+      toast.error('❌ Bulk scan failed');
     } finally {
       setIsScanningAll(false);
     }
   }
 
   async function handleBulkExportPDF() {
-    if (filteredDevices.length === 0 || isExportingBulk) {
-      toast.warning('⚠️ Export Canceled', {
-        description: `No devices matched threat level filter: ${selectedRiskFilter}`,
-      });
+    if (!filteredDevices.length || isExportingBulk) {
+      toast.warning('⚠️ Export canceled', { description: `No devices matched threat level filter: ${selectedRiskFilter}` });
       return;
     }
-
     setIsExportingBulk(true);
-
     try {
       await exportBulkPDF(filteredDevices, selectedRiskFilter);
-      toast.success('📄 PDF Exported', {
-        description: `Exported ${filteredDevices.length} device reports.`,
-      });
+      toast.success('📄 PDF exported', { description: `Exported ${filteredDevices.length} device reports.` });
     } catch (err: any) {
-      console.error('Failed to export bulk PDF:', err);
-      toast.error('❌ Export Failed', {
-        description: err.message || 'Unknown error generating PDF.',
-      });
+      toast.error('❌ Export failed', { description: err.message || 'Unknown error generating PDF.' });
     } finally {
       setIsExportingBulk(false);
     }
@@ -644,83 +241,20 @@ export function useDashboard() {
   async function handleAnalyzeCommand(e: React.FormEvent) {
     e.preventDefault();
     if (!proposedCommand.trim() || !selectedDevice) return;
-
     setAnalyzingCommand(true);
     setSandboxAnalysis('');
     setActiveTab('sandbox');
-
-    const sanitizedCommand = sanitizeConfig(proposedCommand);
-
     try {
-      const res = await fetch('/api/analyze-impact', {
+      // The server loads the device's config itself; only the command is sent.
+      const data = await api('/api/analyze-impact', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          vendor: selectedDevice.vendor,
-          activeConfig: currentRawConfig || latestScan?.raw_config || '',
-          proposedCommand: sanitizedCommand,
-        }),
+        json: { deviceId: selectedDevice.id, vendor: selectedDevice.netmiko_type || selectedDevice.vendor, proposedCommand: sanitizeConfig(proposedCommand) },
       });
-
-      const data = await res.json();
-      if (res.ok && data.success) {
-        const impactLevel = (data.impactLevel || data.suggestedAction?.riskLevel || 'Unknown').toUpperCase();
-        const disruptionRisk = (data.disruptionRisk || (data.suggestedAction?.requiresHumanApproval ? 'High' : 'Moderate')).toUpperCase();
-        const summary = data.analysis || data.impactSummary || '';
-        const rationale = data.suggestedAction?.rationale || '';
-        const suggestedCmd = data.suggestedAction?.command || '';
-        const vendorLang = (selectedDevice.vendor || 'cisco').toLowerCase();
-
-        let rollbacks: string[] = [];
-        if (Array.isArray(data.rollbackCommands)) {
-          rollbacks = data.rollbackCommands
-            .flatMap((cmd: any) => String(cmd).replace(/\\n/g, '\n').split(/\r?\n/))
-            .map((cmd: string) => cmd.trim())
-            .filter(Boolean);
-        } else if (typeof data.rollbackCommands === 'string') {
-          rollbacks = data.rollbackCommands
-            .replace(/\\n/g, '\n')
-            .split(/\r?\n/)
-            .map((cmd: string) => cmd.trim())
-            .filter(Boolean);
-        }
-
-        let analysisText = `## 📊 CLI Command Impact Assessment\n\n`;
-        analysisText += `> **Target Device:** \`${selectedDevice.hostname || 'Device'}\` (${selectedDevice.vendor?.toUpperCase() || 'GENERIC'})\n\n`;
-        analysisText += `### 🎯 Assessment Metrics\n`;
-        analysisText += `* **Impact Level:** **${impactLevel}**\n`;
-        analysisText += `* **Disruption Risk:** **${disruptionRisk}**\n\n`;
-
-        if (summary) {
-          analysisText += `### 🔍 Analysis & Disruption Breakdown\n${summary}\n\n`;
-        }
-
-        if (rationale) {
-          analysisText += `### 💡 Operational Rationale\n${rationale}\n\n`;
-        }
-
-        if (suggestedCmd) {
-          const cleanSuggested = String(suggestedCmd).replace(/\\n/g, '\n').trim();
-          analysisText += `### 🛠️ Suggested Execution Command\n\`\`\`${vendorLang}\n${cleanSuggested}\n\`\`\`\n\n`;
-        }
-
-        if (rollbacks.length > 0) {
-          analysisText += `### 🔄 Disaster Recovery Rollback Script\n`;
-          analysisText += `*Execute these commands to revert changes if service is disrupted:*\n\n`;
-          analysisText += `\`\`\`${vendorLang}\n${rollbacks.join('\n')}\n\`\`\`\n`;
-        }
-
-        setSandboxAnalysis(analysisText);
-        toast.info('🧪 Command Analysis Complete', {
-          description: `Impact: ${impactLevel} | Disruption: ${disruptionRisk}`,
-        });
-      } else {
-        setSandboxAnalysis(`❌ **Error (${res.status}):** ${data.error || 'Failed to process command'}`);
-        toast.error('Command analysis error', { description: data.error });
-      }
+      setSandboxAnalysis(buildImpactMarkdown(data, selectedDevice.hostname, selectedDevice.vendor));
+      toast.info('🧪 Command analysis complete', { description: `Impact: ${data.impactLevel} | Disruption: ${data.disruptionRisk}` });
     } catch (err: any) {
-      setSandboxAnalysis(`❌ **System Error:** ${err.message}`);
-      toast.error('System error analyzing command', { description: err.message });
+      setSandboxAnalysis(`❌ **Error:** ${err.message}`);
+      toast.error('Command analysis error', { description: err.message });
     } finally {
       setAnalyzingCommand(false);
     }
@@ -728,140 +262,34 @@ export function useDashboard() {
 
   async function handleAnalyzeFirmware() {
     if (!selectedDevice) return;
-
-    const rawVer =
-      latestScan?.raw_version ||
-      latestScan?.show_version ||
-      latestScan?.os_version ||
-      selectedDevice?.raw_version ||
-      (selectedDevice as any)?.os_version ||
-      selectedDevice?.last_config;
-
-    if (!rawVer) {
-      toast.warning('⚠️ Missing Raw Version', {
-        description: 'Missing raw version data for this device. Collect telemetry first.',
-      });
+    const device = selectedDevice;
+    const rawVersion = latestScan?.raw_version || device.raw_version;
+    if (!rawVersion) {
+      toast.warning('⚠️ Missing "show version" data', { description: 'Collect telemetry first.' });
       return;
     }
-
     setIsScanning(true);
     try {
-      const res = await fetch('/api/analyze-firmware', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: selectedDevice.id,
-          vendor: selectedDevice.vendor,
-          rawVersion: rawVer,
-        }),
+      const data = await api('/api/analyze-firmware', { method: 'POST', json: { deviceId: device.id, rawVersion } });
+      const unifiedRisk = getHighestRisk(latestScan?.risk_level, data.riskLevel);
+      setAiCache((prev) => ({ ...prev, [device.id]: { config: prev[device.id]?.config || '', firmware: data.osSummary, riskLevel: unifiedRisk } }));
+      await persistRisk(device.id, unifiedRisk);
+      await fetchScanResults(device.id);
+      await fetchDevices();
+      toast.success('💻 Firmware audit complete', {
+        description: `Threat level ${data.riskLevel}; ${data.cves?.length ?? 0} CVE(s)${data.kevCount ? `, ${data.kevCount} actively exploited` : ''}.`,
       });
-
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (data?.osSummary || data?.os_summary || data?.analysis) {
-          const newOsSummary = data.osSummary || data.os_summary || data.analysis;
-          const fwRisk = data.riskLevel || 'LOW';
-          const unifiedRisk = getHighestRisk(latestScan?.risk_level, fwRisk);
-
-          const targetFw = data.targetFirmware || data.recommendedVersion || data.target_firmware || 'Recommended Baseline Standard';
-          const eolState = data.eolStatus || data.lifecycleStatus || data.eol_status || 'Mainstream Active';
-
-          // FIX (real bug, confirmed by hand): this used to be
-          // `prev ? { ...prev, target_firmware: targetFw, ... } : null` —
-          // if latestScan was still null at the moment this response came
-          // back (first load, or a race with the initial fetchScanResults
-          // effect), the ENTIRE update was discarded and latestScan stayed
-          // null. The AI's real targetFirmware/eolStatus answer was thrown
-          // away silently. VersionTab's top "Recommended LTS Release" card
-          // reads only from latestScan.target_firmware, so it fell straight
-          // through to the hardcoded VENDOR_BASELINE_DISPLAY placeholder
-          // (always "Cisco IOS-XE 17.09.05 LTS") no matter what the AI
-          // said — which is exactly the contradiction between the top card
-          // and the AI analysis panel below it (the panel reads from
-          // aiCache instead, which was never guarded by `prev` and so
-          // always updated correctly). Now we always construct a full
-          // object — synthesizing sane defaults for the other ScanResult
-          // fields when there's no prior scan yet — so the AI's
-          // targetFirmware/eolStatus is never silently dropped.
-          setLatestScan((prev) => ({
-            ...(prev ?? {
-              scanned_at: new Date().toISOString(),
-              raw_config: '',
-              summary: 'No summary available',
-              vulnerabilities: [],
-              model_used: 'Groq Llama-3',
-              raw_version: typeof rawVer === 'string' ? rawVer : '',
-              show_version: typeof rawVer === 'string' ? rawVer : '',
-              os_version: typeof rawVer === 'string' ? rawVer : '',
-              os_cves: [],
-            }),
-            risk_level: unifiedRisk,
-            os_summary: newOsSummary,
-            version_info: newOsSummary,
-            target_firmware: targetFw,
-            eol_status: eolState,
-          }));
-
-          setAiCache((prev) => ({
-            ...prev,
-            [selectedDevice.id]: {
-              config: prev[selectedDevice.id]?.config || '',
-              firmware: newOsSummary,
-              riskLevel: unifiedRisk,
-            },
-          }));
-
-          try {
-            await fetch('/api/update-device-risk', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                deviceId: selectedDevice.id,
-                riskLevel: unifiedRisk,
-              }),
-            });
-          } catch (err) {
-            console.error('Failed to persist firmware risk level:', err);
-          }
-
-          await fetchDevices();
-
-          toast.success('💻 Firmware Audit Complete', {
-            description: `OS firmware analysis updated (Threat Level: ${fwRisk}).`,
-          });
-        }
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        toast.error('❌ Firmware Audit Failed', {
-          description: errData.error || 'Unknown server error during firmware assessment.',
-        });
-      }
     } catch (err: any) {
-      console.error('Failed to trigger firmware audit:', err);
-      toast.error('❌ Error Running Firmware Audit', {
-        description: err.message,
-      });
+      toast.error('❌ Firmware audit failed', { description: err.message });
     } finally {
-      // FIX: always release the lock, success or failure, so the button
-      // isn't stuck disabled forever if the request errors out.
       setIsScanning(false);
     }
   }
 
   const handleExportPDF = (device: Device) => {
     setSelectedDevice(device);
-    setGeneratedDate(
-      new Date().toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-      })
-    );
-    setTimeout(() => {
-      window.print();
-    }, 150);
+    setGeneratedDate(new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+    setTimeout(() => window.print(), 150);
   };
 
   return {
@@ -890,6 +318,7 @@ export function useDashboard() {
     currentRawVersion,
     currentOsSummary,
     activeDeviceRisk,
+    fetchDevices,
     handleCollectTelemetry,
     handleRunScan,
     handleScanAll,

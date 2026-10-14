@@ -1,12 +1,7 @@
-// C:\Users\hp\aiops-securewatch\dashboard\lib\security.ts
+// dashboard/lib/security.ts
 /**
  * Security & Input Validation Utilities
  * Location: dashboard/lib/security.ts
- *
- * FIX: dashboard/lib/promptSafety.ts duplicated this module (a second,
- * weaker signature list) and was never imported anywhere. It's deleted;
- * its one genuinely useful export, wrapUntrustedContent, is merged in below
- * so it's no longer dead code.
  */
 export interface PromptInjectionScanResult {
   flagged: boolean;

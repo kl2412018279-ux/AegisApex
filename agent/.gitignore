@@ -1,4 +1,3 @@
-// C:\Users\hp\aiops-securewatch\agent\.gitignore
 # Environment & Secret Files
 .env
 .env.*
@@ -72,3 +71,6 @@ pytestdebug.log
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Example env files are documentation, not secrets
+!.env.example

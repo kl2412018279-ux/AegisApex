@@ -100,15 +100,7 @@ export function InventoryTab({
     { critical: 0, high: 0, medium: 0, low: 0, unassessed: 0 }
   );
 
-  // FIX: this list previously rendered `filteredDevices` in whatever order
-  // it arrived in, with no sort of its own. That order can shift between
-  // re-renders (risk values update at different times per-device during a
-  // bulk scan, the parent's own fetch can return rows in a different
-  // sequence, etc.), which is what showed up as devices visibly "jumping"
-  // positions after clicking "Scan Inventory". Sorting here, by a key that
-  // doesn't change moment-to-moment (severity, then hostname as a tiebreak),
-  // fixes both asks: Critical-to-Low ordering, and a position that only
-  // moves when a device's own severity genuinely changes.
+  // Stable order (severity, then hostname) so rows don't jump during a bulk scan.
   const RISK_SORT_RANK: Record<string, number> = {
     CRITICAL: 0,
     HIGH: 1,

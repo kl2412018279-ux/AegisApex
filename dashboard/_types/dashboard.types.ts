@@ -1,5 +1,5 @@
 // dashboard/_types/dashboard.types.ts
-export type NavigationTab = 'inventory' | 'config' | 'version' | 'sandbox';
+export type NavigationTab = 'inventory' | 'config' | 'version' | 'sandbox' | 'changes' | 'compliance' | 'remediation' | 'admin';
 
 export interface AiCacheEntry {
   config: string;
@@ -17,13 +17,32 @@ export interface Device {
   connection_status: string;
   last_seen_at: string;
   risk_level: string;
-  // FIX: ssh_user / ssh_pass removed from the client-facing Device type.
-  // They were being fetched with the public anon key and held in browser
-  // state (see the fix note in _hooks/useDashboard.ts). Credentials should
-  // only ever exist server-side, resolved through the vault RPC the Python
-  // agent already uses (agent/collector.py: fetch_decrypted_credentials).
+  // Credentials never reach the browser: they live in Supabase Vault and
+  // the migration hides credential columns from browser roles.
   last_config?: string | null;
   raw_version?: string | null;
+  os_version?: string | null;
+  org_id?: string | null;
+  is_mock?: boolean;
+  collection_interval_minutes?: number | null;
+  next_collection_at?: string | null;
+  last_collection_error?: string | null;
+  ssh_host_key_fingerprint?: string | null;
+  ssh_host_key_pinned_at?: string | null;
+}
+
+export type Role = 'viewer' | 'operator' | 'admin';
+
+export interface Membership {
+  orgId: string;
+  orgName: string;
+  role: Role;
+}
+
+export interface Me {
+  userId: string;
+  email: string | null;
+  memberships: Membership[];
 }
 
 export interface Vulnerability {
@@ -36,6 +55,8 @@ export interface Vulnerability {
   summary?: string;
   remediation?: string;
   remediation_cli?: string;
+  rule_id?: string | null;
+  evidence?: string | null;
 }
 
 export interface ScanResult {

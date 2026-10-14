@@ -28,3 +28,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Example env files are documentation, not secrets
+!**/.env.example
