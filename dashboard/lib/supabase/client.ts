@@ -1,4 +1,3 @@
-// C:\Users\hp\aiops-securewatch\dashboard\lib\supabase\client.ts
 // dashboard/lib/supabase/client.ts
 import { createBrowserClient } from '@supabase/ssr'
 

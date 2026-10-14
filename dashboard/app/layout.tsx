@@ -1,4 +1,4 @@
-//C:\Users\hp\aiops-securewatch\dashboard\app\layout.tsx
+// dashboard/app/layout.tsx
 import React from 'react';
 import type { Metadata } from 'next';
 import './global.css';

@@ -4,15 +4,6 @@ import { Cpu, Sparkles, Loader2 } from 'lucide-react';
 import { Device, ScanResult, AiCacheEntry } from '../_types/dashboard.types';
 import { getRiskColor } from '../_utils/riskHelpers';
 import { renderFormattedAnalysis } from '../_utils/formatters';
-// FIX: this file used to run its own tiny ad-hoc vendor check
-// (`vendorStr.includes('cisco')` etc., covering only cisco/aruba/dell) as
-// its last-resort guess for a never-analyzed device. That's the same
-// vendor-detection duplication problem fixed in analyze-firmware/route.ts —
-// now this file uses the one real detectVendor() too, so "never analyzed
-// yet" devices on any of the 16 platforms cisBenchmarks.ts knows about get
-// a sensible vendor-specific placeholder instead of all non-Cisco/Aruba/Dell
-// vendors (Fortinet included) falling into one generic "Vendor Secure
-// Baseline" bucket.
 import { detectVendor, VendorType } from '../lib/cisBenchmarks';
 
 interface VersionTabProps {
@@ -69,16 +60,7 @@ export function VersionTab({
   const cachedAnalysis = selectedDevice?.id ? aiCache[selectedDevice.id]?.firmware : null;
   const osSummaryToRender = cachedAnalysis || currentOsSummary;
 
-  // FIX: useDashboard.ts's fetchScanResults() defaults target_firmware/
-  // eol_status to the literal string "Not yet analyzed" whenever a scan
-  // row doesn't have them persisted yet (e.g. a brand-new device's very
-  // first scan). That string is non-empty, so the plain `!target` / `!eol`
-  // checks below treated it as "already have a real answer" and skipped
-  // straight past the bullet-extraction fix — displaying "Not yet
-  // analyzed" in the hero cards even while the AI analysis panel right
-  // next to it showed the real, already-computed answer. Treat this
-  // sentinel (and plain emptiness) the same way: as "nothing resolved
-  // yet", so the extraction below actually runs.
+  // "Not yet analyzed" is the placeholder for a scan without lifecycle data.
   const isUnresolvedPlaceholder = (v: string | null | undefined): boolean =>
     !v || v.trim().toLowerCase() === 'not yet analyzed';
 
@@ -102,19 +84,9 @@ export function VersionTab({
     }
 
     if (osSummaryToRender) {
-      // FIX: both checks below used to scan the whole free-form AI narrative
-      // with loose keyword regexes. That's what produced a real bug: the
-      // AI's own executive summary for an EOL Palo Alto device read
-      // "Immediate upgrade to a supported release is required" — the old
-      // EOL regex matched the bare word "supported" in that sentence and
-      // displayed "Active / Supported" for a device the same screen's AI
-      // analysis correctly labeled "End-of-Life (EOL)" one panel over. The
-      // AI's own response already includes unambiguous, explicitly-labeled
-      // bullet lines ("▸ Lifecycle Support Status: ...", "▸ Recommended LTS
-      // Release: ...") produced by the backend's formattedMarkdownSummary —
-      // we now parse those directly first, and only fall back to the old
-      // loose keyword guesses if a bullet line isn't present (e.g. an older
-      // cached analysis saved before this format existed).
+      // Prefer the explicitly labelled bullet lines the backend writes; loose
+      // keyword matching once read "a supported release is required" as
+      // "Active / Supported" on an EOL device.
 
       // 1. Lifecycle support detection — prefer the AI's own labeled bullet.
       if (!eol) {
@@ -143,10 +115,6 @@ export function VersionTab({
     }
 
     // 3. Hardware Vendor Baseline Fallbacks
-    // FIX: replaced the old 3-vendor `.includes()` chain (cisco/aruba/dell
-    // only, everything else incl. fortinet => generic "Vendor Secure
-    // Baseline") with the same detectVendor() used everywhere else in the
-    // system, plus a lookup table covering all 16 platforms.
     if (!target || target.toLowerCase().includes('recommended') || target.toLowerCase().includes('latest')) {
       const vendorStr = `${selectedDevice?.vendor || ''} ${selectedDevice?.netmiko_type || ''} ${currentRawVersion}`.toLowerCase();
       const vendorType = detectVendor(vendorStr);

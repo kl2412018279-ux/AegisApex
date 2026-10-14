@@ -211,13 +211,6 @@ export function SandboxTab({
         </div>
 
         {/* Formatted Output Canvas */}
-        {/* FIX: this whole panel body was hardcoded to dark-theme colors
-            (bg-slate-950/text-slate-200/border-slate-900) with no isDarkMode
-            check at all, and renderFormattedAnalysis was called with a
-            hardcoded `true` for its isDark argument regardless of the real
-            toggle state — so the AI-rendered text itself always used dark
-            palette colors too. Both are now conditional, matching the other
-            panels (ConfigTab/VersionTab), plus theme-aware scrollbar styling. */}
         <div
           className={`flex-1 p-5 overflow-y-auto leading-relaxed rounded-b-xl border-t text-xs [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full ${
             isDarkMode

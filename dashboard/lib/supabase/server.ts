@@ -3,16 +3,7 @@
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 
-// FIX (same as lib/supabase/client.ts): fallback to NEXT_PUBLIC_SUPABASE_ANON_KEY
-// so this doesn't depend on which key-naming convention your project uses.
-//
-// FIX: `cookies()` from `next/headers` is async as of recent Next.js
-// versions — calling it without `await` (as the version you added did)
-// either throws or silently gets a Promise where a cookie store was
-// expected, depending on your exact Next.js version. `createClient` is
-// already `async` in your auth/callback/route.ts caller (`await
-// createClient()`), so awaiting here is consistent with how it's already
-// being called.
+// cookies() is async in current Next.js.
 export async function createClient() {
   const cookieStore = await cookies()
 
